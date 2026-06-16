@@ -1,0 +1,30 @@
+{
+  "raw_audio_dir": "~/Downloads/测试音频",
+  "clips_dir": "~/Downloads/test/slices",
+  "final_output_dir": "~/Downloads/test/results",
+  "export_dir": "~/Downloads/test/export",
+  "downloads_dir": "~/Downloads/test/packages",
+  "gemini_uploads_dir": "output/gemini_uploads",
+  "gemini_model": "gemini-3.1-pro-preview",
+  "gemini_timeout_sec": 180,
+  "categories": [
+    {
+      "id": "lyrical",
+      "name": "抒情",
+      "description": "叙事、情绪、柔和旋律、慢歌舒缓。",
+      "priority": 3
+    },
+    {
+      "id": "high_note",
+      "name": "高音",
+      "description": "人声高音、强声、爆发、飙唱、高潮感。",
+      "priority": 1
+    },
+    {
+      "id": "mid_fast",
+      "name": "中速",
+      "description": "鼓点律动推进明显，速度感和动感强。",
+      "priority": 2
+    }
+  ]
+}

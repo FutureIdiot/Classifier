@@ -1,0 +1,6 @@
+nicegui
+fastapi
+google-genai
+python-dotenv
+pydantic
+pandas
