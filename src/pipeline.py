@@ -17,7 +17,7 @@ from src.audio_utils import (
 from src.config import ERRORS_PATH, append_jsonl, resolve_project_path, save_app_config, save_results
 from src.gemini_client import GeminiClient
 from src.models import AppConfig, CategoryConfig, ClipRecord, GeminiSegment, ResultsState
-from src.prompt_builder import build_prompt
+from src.prompt_builder import build_prompt, build_static_prompt_context, build_track_prompt, prompt_cache_hash
 
 
 ProgressCallback = Callable[[str], None]
@@ -38,6 +38,18 @@ def analyze_tracks(
     tracks = scan_tracks(config)
     emit(progress, f"开始分析队列：{len(tracks)} 个音频文件，目录 {raw_root}")
     client = GeminiClient(config.gemini_model, config.gemini_timeout_sec)
+    cached_content_name = None
+    if config.enable_prompt_cache:
+        static_prompt = build_static_prompt_context(config.categories)
+        cache_hash = prompt_cache_hash(config.gemini_model, config.categories)
+        cached_content_name = client.get_or_create_prompt_cache(
+            cache_hash=cache_hash,
+            static_prompt=static_prompt,
+            ttl_sec=config.prompt_cache_ttl_sec,
+            log=progress,
+        )
+    else:
+        emit(progress, "prompt cache 已关闭，使用完整 prompt。")
     known_track_ids = {clip.track_id for clip in state.clips if clip.status != "replaced"}
     success_count = 0
     skipped_count = 0
@@ -58,8 +70,16 @@ def analyze_tracks(
             duration = get_audio_duration(audio_path)
             emit(progress, f"音频时长 {duration:.1f}s，准备调用 Gemini：{audio_path.name}")
             upload_audio_path = prepare_gemini_upload_audio(audio_path, track_id, config, progress)
-            prompt = build_prompt(track_id, config.categories)
-            gemini_result = client.analyze_audio(upload_audio_path, prompt, track_id, progress)
+            fallback_prompt = build_prompt(track_id, config.categories)
+            prompt = build_track_prompt(track_id, config.categories) if cached_content_name else fallback_prompt
+            gemini_result = client.analyze_audio(
+                upload_audio_path,
+                prompt,
+                track_id,
+                progress,
+                cached_content_name=cached_content_name,
+                fallback_prompt=fallback_prompt if cached_content_name else None,
+            )
             emit(progress, f"Gemini 返回 {len(gemini_result.segments)} 个片段：{audio_path.name}")
             for seg_index, segment in enumerate(gemini_result.segments, start=1):
                 try:

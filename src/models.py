@@ -22,6 +22,8 @@ class AppConfig(BaseModel):
     gemini_uploads_dir: str = "output/gemini_uploads"
     gemini_model: str = "gemini-3.1-pro-preview"
     gemini_timeout_sec: int = 180
+    enable_prompt_cache: bool = True
+    prompt_cache_ttl_sec: int = 86400
     categories: list[CategoryConfig] = Field(default_factory=list)
 
 

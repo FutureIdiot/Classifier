@@ -11,7 +11,7 @@ import httpx
 from google import genai
 from google.genai import types
 
-from src.config import RAW_RESPONSES_PATH, append_jsonl, load_environment
+from src.config import PROMPT_CACHE_PATH, RAW_RESPONSES_PATH, append_jsonl, load_environment
 from src.models import GeminiTrackResult
 
 
@@ -33,6 +33,30 @@ def extract_json(text: str) -> dict[str, Any]:
         raise
 
 
+def usage_metadata_to_dict(usage: Any) -> dict[str, Any] | None:
+    if usage is None:
+        return None
+    if hasattr(usage, "model_dump"):
+        return usage.model_dump(mode="json", exclude_none=True)
+    if isinstance(usage, dict):
+        return {key: value for key, value in usage.items() if value is not None}
+    return None
+
+
+def usage_summary(usage: dict[str, Any] | None) -> str:
+    if not usage:
+        return "usage metadata 未返回"
+    fields = [
+        ("prompt", "prompt_token_count"),
+        ("cached", "cached_content_token_count"),
+        ("output", "candidates_token_count"),
+        ("thoughts", "thoughts_token_count"),
+        ("total", "total_token_count"),
+    ]
+    parts = [f"{label}={usage.get(key)}" for label, key in fields if usage.get(key) is not None]
+    return "tokens: " + ", ".join(parts) if parts else "usage metadata 未包含 token 字段"
+
+
 class GeminiClient:
     def __init__(self, model: str, timeout_sec: int = 180) -> None:
         load_environment()
@@ -52,6 +76,8 @@ class GeminiClient:
         prompt: str,
         track_id: str,
         log: LogCallback | None = None,
+        cached_content_name: str | None = None,
+        fallback_prompt: str | None = None,
     ) -> GeminiTrackResult:
         should_cleanup_upload = True
         self._log(log, f"上传音频到 Gemini：{audio_path.name}")
@@ -68,11 +94,14 @@ class GeminiClient:
             if file_uri:
                 self._log(log, "Gemini 已返回文件 URI，说明音频已被服务端接收。")
             self._verify_uploaded_file(file_name, log)
-            self._log(log, f"发送流式生成请求：{self.model}，等待上限 {self.timeout_sec}s")
+            cache_note = f"，使用 prompt cache {cached_content_name}" if cached_content_name else ""
+            self._log(log, f"发送流式生成请求：{self.model}，等待上限 {self.timeout_sec}s{cache_note}")
             text_parts: list[str] = []
             first_chunk_at: float | None = None
             chunk_count = 0
             used_fallback = False
+            usage_metadata: dict[str, Any] | None = None
+            last_usage_line = ""
             started_at = time.monotonic()
             try:
                 stream = self.client.models.generate_content_stream(
@@ -81,12 +110,16 @@ class GeminiClient:
                         uploaded_file,
                         types.Part.from_text(text=prompt),
                     ],
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        temperature=0.2,
-                    ),
+                    config=self._generation_config(cached_content_name),
                 )
                 for chunk in stream:
+                    chunk_usage = usage_metadata_to_dict(getattr(chunk, "usage_metadata", None))
+                    if chunk_usage:
+                        usage_metadata = chunk_usage
+                        current_usage_line = usage_summary(usage_metadata)
+                        if current_usage_line != last_usage_line:
+                            self._log(log, current_usage_line)
+                            last_usage_line = current_usage_line
                     chunk_text = chunk.text or ""
                     if first_chunk_at is None:
                         first_chunk_at = time.monotonic()
@@ -127,12 +160,10 @@ class GeminiClient:
                             uploaded_file,
                             types.Part.from_text(text=prompt),
                         ],
-                        config=types.GenerateContentConfig(
-                            response_mime_type="application/json",
-                            temperature=0.2,
-                        ),
+                        config=self._generation_config(cached_content_name),
                     )
                     text = response.text or ""
+                    usage_metadata = usage_metadata_to_dict(getattr(response, "usage_metadata", None))
                     self._log(log, f"普通生成请求返回，用时 {time.monotonic() - retry_started_at:.1f}s，收到 {len(text)} 字符")
                 except httpx.TimeoutException as retry_exc:
                     retry_elapsed = time.monotonic() - retry_started_at
@@ -152,6 +183,9 @@ class GeminiClient:
                     )
                     raise
             except Exception as exc:
+                if cached_content_name and fallback_prompt:
+                    self._log(log, f"使用 prompt cache 请求失败，切换完整 prompt 重试：{type(exc).__name__}，{exc}")
+                    return self.analyze_audio(audio_path, fallback_prompt, track_id, log, None, None)
                 elapsed = time.monotonic() - started_at
                 self._log(log, f"Gemini 流式请求异常：实际等待 {elapsed:.1f}s，异常类型 {type(exc).__name__}，{exc}")
                 raise
@@ -159,12 +193,15 @@ class GeminiClient:
                 self._log(log, "Gemini 流式请求结束，但没有收到任何文本 chunk。")
             response_mode = "普通生成 fallback" if used_fallback else "流式响应"
             self._log(log, f"Gemini {response_mode}结束，共收到 {len(text)} 字符，准备解析 JSON")
+            self._log(log, usage_summary(usage_metadata))
             append_jsonl(
                 RAW_RESPONSES_PATH,
                 {
                     "track_id": track_id,
                     "source_audio_path": str(audio_path),
                     "response": text,
+                    "usage_metadata": usage_metadata,
+                    "cached_content_name": cached_content_name,
                 },
             )
             payload = extract_json(text)
@@ -181,6 +218,67 @@ class GeminiClient:
     def _log(self, log: LogCallback | None, message: str) -> None:
         if log:
             log(message)
+
+    def _generation_config(self, cached_content_name: str | None = None) -> types.GenerateContentConfig:
+        return types.GenerateContentConfig(
+            response_mime_type="application/json",
+            temperature=0.2,
+            cached_content=cached_content_name,
+        )
+
+    def get_or_create_prompt_cache(
+        self,
+        cache_hash: str,
+        static_prompt: str,
+        ttl_sec: int,
+        log: LogCallback | None = None,
+    ) -> str | None:
+        cached = self._load_prompt_cache_record()
+        if (
+            cached
+            and cached.get("hash") == cache_hash
+            and cached.get("model") == self.model
+            and cached.get("name")
+        ):
+            try:
+                self.client.caches.get(name=cached["name"])
+                self._log(log, f"复用 prompt cache：{cached['name']}")
+                return cached["name"]
+            except Exception as exc:
+                self._log(log, f"已有 prompt cache 不可用，将重建：{exc}")
+
+        try:
+            self._log(log, "创建 prompt cache：固定分类规则和系统提示")
+            cache = self.client.caches.create(
+                model=self.model,
+                config=types.CreateCachedContentConfig(
+                    display_name=f"music-classifier-{cache_hash[:12]}",
+                    contents=static_prompt,
+                    ttl=f"{max(300, int(ttl_sec or 86400))}s",
+                ),
+            )
+            name = getattr(cache, "name", "")
+            if not name:
+                self._log(log, "prompt cache 创建成功但没有返回 name，改用普通 prompt。")
+                return None
+            self._save_prompt_cache_record({"hash": cache_hash, "model": self.model, "name": name})
+            self._log(log, f"prompt cache 创建成功：{name}")
+            return name
+        except Exception as exc:
+            self._log(log, f"prompt cache 创建失败，改用普通 prompt：{type(exc).__name__}，{exc}")
+            return None
+
+    def _load_prompt_cache_record(self) -> dict | None:
+        if not PROMPT_CACHE_PATH.exists():
+            return None
+        try:
+            return json.loads(PROMPT_CACHE_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+
+    def _save_prompt_cache_record(self, payload: dict) -> None:
+        PROMPT_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        PROMPT_CACHE_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def _verify_uploaded_file(self, file_name: str, log: LogCallback | None) -> None:
         if not file_name:

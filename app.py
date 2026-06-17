@@ -8,6 +8,7 @@ import sys
 from collections import deque
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from fastapi import Header, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
@@ -16,9 +17,10 @@ from nicegui import app, ui
 from src.audio_utils import seconds_to_mmss
 from src.config import (
     ERRORS_PATH,
+    PROMPT_CACHE_PATH,
     RAW_RESPONSES_PATH,
     ROOT,
-RESULTS_PATH,
+    RESULTS_PATH,
     get_gemini_api_key,
     load_app_config,
     load_results,
@@ -1212,6 +1214,87 @@ def run_status_text() -> str:
     return progress_text
 
 
+def load_token_usage_stats() -> dict[str, Any]:
+    stats: dict[str, Any] = {
+        "records": 0,
+        "with_usage": 0,
+        "cached_requests": 0,
+        "prompt_tokens": 0,
+        "cached_tokens": 0,
+        "output_tokens": 0,
+        "thoughts_tokens": 0,
+        "total_tokens": 0,
+        "latest": None,
+    }
+    if not RAW_RESPONSES_PATH.exists():
+        return stats
+    with RAW_RESPONSES_PATH.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            stats["records"] += 1
+            if record.get("cached_content_name"):
+                stats["cached_requests"] += 1
+            usage = record.get("usage_metadata") or {}
+            if not isinstance(usage, dict) or not usage:
+                continue
+            stats["with_usage"] += 1
+            stats["prompt_tokens"] += int(usage.get("prompt_token_count") or 0)
+            stats["cached_tokens"] += int(usage.get("cached_content_token_count") or 0)
+            stats["output_tokens"] += int(usage.get("candidates_token_count") or 0)
+            stats["thoughts_tokens"] += int(usage.get("thoughts_token_count") or 0)
+            stats["total_tokens"] += int(usage.get("total_token_count") or 0)
+            stats["latest"] = {
+                "track_id": record.get("track_id", ""),
+                "cached": bool(record.get("cached_content_name")),
+                "usage": usage,
+            }
+    return stats
+
+
+def token_value(value: int) -> str:
+    return f"{value:,}" if value else "-"
+
+
+@ui.refreshable
+def render_token_usage_panel() -> None:
+    stats = load_token_usage_stats()
+    latest = stats["latest"] or {}
+    latest_usage = latest.get("usage") or {}
+    latest_text = "暂无 token usage。"
+    if latest_usage:
+        latest_parts = [
+            f"track={latest.get('track_id') or '-'}",
+            f"cache={'是' if latest.get('cached') else '否'}",
+            f"prompt={latest_usage.get('prompt_token_count', '-')}",
+            f"cached={latest_usage.get('cached_content_token_count', '-')}",
+            f"output={latest_usage.get('candidates_token_count', '-')}",
+            f"thoughts={latest_usage.get('thoughts_token_count', '-')}",
+            f"total={latest_usage.get('total_token_count', '-')}",
+        ]
+        latest_text = " · ".join(latest_parts)
+
+    with ui.card().classes("w-full p-2").style("border-radius:8px"):
+        with ui.row().classes("items-center justify-between w-full"):
+            ui.label("Token 统计").classes("text-sm font-bold")
+            ui.label(f"响应 {stats['records']} 条 / 有 usage {stats['with_usage']} 条 / cache 请求 {stats['cached_requests']} 条").classes(
+                "text-xs text-gray-500"
+            )
+        with ui.row().classes("gap-3 text-xs text-gray-700"):
+            ui.label(f"prompt: {token_value(stats['prompt_tokens'])}")
+            ui.label(f"cached: {token_value(stats['cached_tokens'])}")
+            ui.label(f"output: {token_value(stats['output_tokens'])}")
+            ui.label(f"thoughts: {token_value(stats['thoughts_tokens'])}")
+            ui.label(f"total: {token_value(stats['total_tokens'])}")
+        ui.label(f"最近一次：{latest_text}").classes("text-xs text-gray-500")
+        if stats["records"] and not stats["with_usage"]:
+            ui.label("当前 Gemini API/模型没有在响应里返回 token usage；日志和 raw_responses 会在可用时自动记录。").classes(
+                "text-xs text-orange-600"
+            )
+
+
 def update_run_widgets() -> None:
     if run_status_label is not None:
         run_status_label.set_text(run_status_text())
@@ -1302,6 +1385,7 @@ def clear_data_dialog():
         ui.label("默认只清空结果和日志，不会删除原始音频。勾选输出目录后，会删除已生成的切片、导出文件和 Gemini 上传代理。").classes("text-sm text-gray-600")
         clear_results = ui.checkbox("清空 data/results.json", value=True)
         clear_logs = ui.checkbox("清空 data/raw_responses.jsonl 和 data/errors.jsonl", value=True)
+        clear_prompt_cache = ui.checkbox("清除 prompt cache 记录", value=False)
         clear_outputs = ui.checkbox("删除 clips/final/export/gemini_uploads 目录内容", value=False)
         confirm_text = ui.input("输入 CLEAR 确认").props("outlined dense").classes("w-full")
 
@@ -1318,6 +1402,8 @@ def clear_data_dialog():
                     for path in [RAW_RESPONSES_PATH, ERRORS_PATH]:
                         if path.exists():
                             path.unlink()
+                if clear_prompt_cache.value and PROMPT_CACHE_PATH.exists():
+                    PROMPT_CACHE_PATH.unlink()
                 if clear_outputs.value:
                     for path_value in [
                         config.clips_dir,
@@ -1335,6 +1421,7 @@ def clear_data_dialog():
                 render_board.refresh()
                 render_recut_area.refresh()
                 render_result_controls.refresh()
+                render_token_usage_panel.refresh()
                 dialog.close()
                 ui.notify("清除完成")
             except Exception as exc:
@@ -1357,6 +1444,8 @@ def settings_dialog():
         gemini_uploads_dir = ui.input("Gemini 上传代理目录", value=config.gemini_uploads_dir).props("outlined dense").classes("w-full")
         model = ui.input("Gemini 模型名", value=config.gemini_model).props("outlined dense").classes("w-full")
         timeout = ui.number("Gemini 超时秒数", value=config.gemini_timeout_sec, min=30, step=30, format="%d").props("outlined dense").classes("w-full")
+        enable_prompt_cache = ui.checkbox("启用 prompt cache（缓存固定分类规则）", value=config.enable_prompt_cache)
+        prompt_cache_ttl = ui.number("Prompt cache TTL 秒", value=config.prompt_cache_ttl_sec, min=300, step=3600, format="%d").props("outlined dense").classes("w-full")
         api_key = ui.input("Gemini API Key", value=get_gemini_api_key(), password=True, password_toggle_button=True).props("outlined dense").classes("w-full")
         model_list = ui.textarea("当前 API Key 可用模型", value="").props("readonly outlined dense autogrow").classes("w-full")
         ui.label("API Key 会保存到本地 .env，不会写入 results.json。分类列可直接在主看板顶部修改。").classes("text-xs text-gray-500")
@@ -1379,6 +1468,8 @@ def settings_dialog():
             config.gemini_uploads_dir = gemini_uploads_dir.value
             config.gemini_model = model.value
             config.gemini_timeout_sec = int(timeout.value or 180)
+            config.enable_prompt_cache = bool(enable_prompt_cache.value)
+            config.prompt_cache_ttl_sec = int(prompt_cache_ttl.value or 86400)
             save_gemini_api_key(api_key.value or "")
             save_app_config(config)
             dialog.close()
@@ -1422,6 +1513,7 @@ async def do_analyze(progress_label) -> None:
         reload_state()
         render_board.refresh()
         render_recut_area.refresh()
+        render_token_usage_panel.refresh()
         if return_code in {-15, 1, 130} and "正在终止分析子进程" in "\n".join(run_logs):
             add_log("分析已中断，Gemini 请求已随子进程终止。")
             ui.notify("分析已中断")
@@ -1474,6 +1566,7 @@ def main() -> None:
         with ui.row().classes("items-center gap-2"):
             progress_label = ui.label(progress_text).classes("text-xs text-gray-500")
             ui.timer(0.5, lambda: (progress_label.set_text(progress_text), update_run_widgets()))
+            ui.timer(3.0, render_token_usage_panel.refresh)
             async def start_analyze_click() -> None:
                 await do_analyze(progress_label)
 
@@ -1488,6 +1581,7 @@ def main() -> None:
 
     with ui.column().classes("w-full p-4 gap-4"):
         render_run_panel()
+        render_token_usage_panel()
         render_recut_area()
         render_result_controls()
         render_board()

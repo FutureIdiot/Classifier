@@ -17,6 +17,7 @@ RESULTS_PATH = ROOT / "data" / "results.json"
 RAW_RESPONSES_PATH = ROOT / "data" / "raw_responses.jsonl"
 ERRORS_PATH = ROOT / "data" / "errors.jsonl"
 ENV_PATH = ROOT / ".env"
+PROMPT_CACHE_PATH = ROOT / "data" / "prompt_cache.json"
 
 
 def resolve_project_path(path_value: str) -> Path:
