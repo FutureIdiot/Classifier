@@ -154,11 +154,18 @@ def analyze_audio_with_retries(
             if attempt >= max_attempts:
                 raise
             emit(progress, f"Gemini 可重试错误：{exc}")
-            emit(progress, "等待 2 秒后重试当前歌曲。")
+            delay_sec = retry_delay_seconds(attempt)
+            emit(progress, f"等待 {delay_sec} 秒后重试当前歌曲。")
             import time
 
-            time.sleep(2)
+            time.sleep(delay_sec)
     raise RuntimeError("Gemini 分析重试流程异常结束。")
+
+
+def retry_delay_seconds(failed_attempt: int) -> int:
+    delays = [3, 10, 30, 60]
+    index = max(0, min(failed_attempt - 1, len(delays) - 1))
+    return delays[index]
 
 
 def prepare_gemini_upload_audio(

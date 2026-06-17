@@ -9,6 +9,7 @@ from typing import Any, Callable
 
 import httpx
 from google import genai
+from google.genai import errors as genai_errors
 from google.genai import types
 
 from src.config import PROMPT_CACHE_PATH, RAW_RESPONSES_PATH, append_jsonl, load_environment
@@ -20,6 +21,30 @@ LogCallback = Callable[[str], None]
 
 class GeminiRetryableError(RuntimeError):
     pass
+
+
+RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+
+
+def retryable_api_error(exc: Exception) -> bool:
+    code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+    if code in RETRYABLE_STATUS_CODES:
+        return True
+    text = str(exc)
+    return any(
+        marker in text
+        for marker in [
+            "429",
+            "500",
+            "502",
+            "503",
+            "504",
+            "UNAVAILABLE",
+            "RESOURCE_EXHAUSTED",
+            "DEADLINE_EXCEEDED",
+            "INTERNAL",
+        ]
+    )
 
 
 def extract_json(text: str) -> dict[str, Any]:
@@ -185,7 +210,18 @@ class GeminiClient:
                         log,
                         f"普通生成请求也失败：实际等待 {retry_elapsed:.1f}s，异常类型 {type(retry_exc).__name__}，{retry_exc}",
                     )
+                    if retryable_api_error(retry_exc):
+                        raise GeminiRetryableError(f"Gemini 普通生成请求可重试错误：{retry_exc}") from retry_exc
                     raise
+            except (genai_errors.APIError, genai_errors.ClientError, genai_errors.ServerError) as exc:
+                if cached_content_name and fallback_prompt:
+                    self._log(log, f"使用 prompt cache 请求失败，切换完整 prompt 重试：{type(exc).__name__}，{exc}")
+                    return self.analyze_audio(audio_path, fallback_prompt, track_id, log, None, None)
+                elapsed = time.monotonic() - started_at
+                self._log(log, f"Gemini API 请求异常：实际等待 {elapsed:.1f}s，异常类型 {type(exc).__name__}，{exc}")
+                if retryable_api_error(exc):
+                    raise GeminiRetryableError(f"Gemini API 可重试错误：{exc}") from exc
+                raise
             except Exception as exc:
                 if cached_content_name and fallback_prompt:
                     self._log(log, f"使用 prompt cache 请求失败，切换完整 prompt 重试：{type(exc).__name__}，{exc}")

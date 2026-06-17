@@ -170,41 +170,17 @@ def edit_source_media(track_id: str, range_header: str | None = Header(default=N
 
 def audio_response(path: Path, filename: str, range_header: str | None = None) -> Response:
     path = path.expanduser()
-    file_size = path.stat().st_size
-    headers = {
-        "Accept-Ranges": "bytes",
-    }
-    if not range_header:
-        with path.open("rb") as handle:
-            data = handle.read()
-        headers["Content-Length"] = str(file_size)
-        return Response(content=data, status_code=200, media_type="audio/wav", headers=headers)
-
-    start = 0
-    end = file_size - 1
-    range_value = range_header.replace("bytes=", "").strip()
-    try:
-        if "-" in range_value:
-            start_text, end_text = range_value.split("-", 1)
-            if start_text:
-                start = int(start_text)
-            if end_text:
-                end = int(end_text)
-    except ValueError:
-        return Response(status_code=416, headers=headers)
-    start = max(0, min(start, file_size - 1))
-    end = max(start, min(end, file_size - 1))
-    length = end - start + 1
-    with path.open("rb") as handle:
-        handle.seek(start)
-        data = handle.read(length)
-    headers.update(
-        {
-            "Content-Range": f"bytes {start}-{end}/{file_size}",
-            "Content-Length": str(length),
-        }
+    if not path.exists():
+        return Response(content=f"Audio file not found: {path}", status_code=404, media_type="text/plain; charset=utf-8")
+    return FileResponse(
+        path,
+        media_type="audio/wav",
+        filename=filename,
+        headers={
+            "Accept-Ranges": "bytes",
+            "Cache-Control": "no-store",
+        },
     )
-    return Response(content=data, status_code=206, media_type="audio/wav", headers=headers)
 
 
 @app.post("/api/move_clip")
@@ -833,7 +809,22 @@ def add_styles() -> None:
             mcClearPlaying();
             audio.dataset.manualPause = 'false';
             audio.dataset.clipId = clipId;
-            audio.onerror = () => alert('音频加载失败，请直接打开 ' + url + ' 检查接口。');
+            audio.onerror = () => {
+              const error = audio.error;
+              const errorMap = {
+                1: 'MEDIA_ERR_ABORTED',
+                2: 'MEDIA_ERR_NETWORK',
+                3: 'MEDIA_ERR_DECODE',
+                4: 'MEDIA_ERR_SRC_NOT_SUPPORTED',
+              };
+              const code = error ? `${error.code} ${errorMap[error.code] || ''}` : 'unknown';
+              alert(
+                '音频加载失败：' + code +
+                '\\nnetworkState=' + audio.networkState +
+                ' readyState=' + audio.readyState +
+                '\\n请直接打开 ' + url + ' 检查接口。'
+              );
+            };
             audio.src = url + '?t=' + Date.now();
             audio.play()
               .then(() => {
@@ -843,7 +834,12 @@ def add_styles() -> None:
                   if (button) button.textContent = '❚❚';
                 }
               })
-              .catch(error => alert('播放失败：' + error.message));
+              .catch(error => alert(
+                '播放失败：' + error.message +
+                '\\nnetworkState=' + audio.networkState +
+                ' readyState=' + audio.readyState +
+                '\\nURL=' + url
+              ));
           }
           function mcClearPlaying() {
             document.querySelectorAll('.clip-row.is-playing').forEach(row => {
