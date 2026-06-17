@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import html
 import json
+import os
 import shutil
 import sys
 from collections import deque
@@ -41,7 +42,10 @@ from src.pipeline import (
     update_clip_display_name,
     update_clip_label,
 )
+from src.runtime import configure_utf8_runtime
 
+
+configure_utf8_runtime()
 
 config: AppConfig = load_app_config()
 state: ResultsState = load_results()
@@ -1214,6 +1218,13 @@ def run_status_text() -> str:
     return progress_text
 
 
+def last_run_had_failures() -> bool:
+    for line in reversed(run_logs):
+        if "处理结束：" in line:
+            return "失败 0" not in line
+    return False
+
+
 def load_token_usage_stats() -> dict[str, Any]:
     stats: dict[str, Any] = {
         "records": 0,
@@ -1444,6 +1455,7 @@ def settings_dialog():
         gemini_uploads_dir = ui.input("Gemini 上传代理目录", value=config.gemini_uploads_dir).props("outlined dense").classes("w-full")
         model = ui.input("Gemini 模型名", value=config.gemini_model).props("outlined dense").classes("w-full")
         timeout = ui.number("Gemini 超时秒数", value=config.gemini_timeout_sec, min=30, step=30, format="%d").props("outlined dense").classes("w-full")
+        retry_count = ui.number("Gemini 单曲失败重试次数", value=config.gemini_retry_count, min=0, max=5, step=1, format="%d").props("outlined dense").classes("w-full")
         enable_prompt_cache = ui.checkbox("启用 prompt cache（缓存固定分类规则）", value=config.enable_prompt_cache)
         prompt_cache_ttl = ui.number("Prompt cache TTL 秒", value=config.prompt_cache_ttl_sec, min=300, step=3600, format="%d").props("outlined dense").classes("w-full")
         api_key = ui.input("Gemini API Key", value=get_gemini_api_key(), password=True, password_toggle_button=True).props("outlined dense").classes("w-full")
@@ -1468,6 +1480,7 @@ def settings_dialog():
             config.gemini_uploads_dir = gemini_uploads_dir.value
             config.gemini_model = model.value
             config.gemini_timeout_sec = int(timeout.value or 180)
+            config.gemini_retry_count = int(retry_count.value or 0)
             config.enable_prompt_cache = bool(enable_prompt_cache.value)
             config.prompt_cache_ttl_sec = int(prompt_cache_ttl.value or 86400)
             save_gemini_api_key(api_key.value or "")
@@ -1497,6 +1510,12 @@ async def do_analyze(progress_label) -> None:
             "-m",
             "src.worker",
             cwd=str(ROOT),
+            env={
+                **os.environ,
+                "PYTHONUTF8": "1",
+                "PYTHONIOENCODING": "utf-8",
+                "PYTHONLEGACYWINDOWSSTDIO": "0",
+            },
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )
@@ -1525,8 +1544,12 @@ async def do_analyze(progress_label) -> None:
                 add_log(f"分析子进程异常退出，退出码 {return_code}")
                 ui.notify(f"分析失败，退出码 {return_code}", type="negative")
         else:
-            add_log("Gemini 分析完成")
-            ui.notify("Gemini 分析完成")
+            if last_run_had_failures():
+                add_log("Gemini 分析完成，但有歌曲失败；可查看 data/errors.jsonl 后重跑。")
+                ui.notify("分析完成，但有歌曲失败", type="warning")
+            else:
+                add_log("Gemini 分析完成")
+                ui.notify("Gemini 分析完成")
     except Exception as exc:
         add_log(f"分析失败：{exc}")
         ui.notify(f"分析失败：{exc}", type="negative")

@@ -1,31 +1,32 @@
 {
-  "raw_audio_dir": "~/Downloads/测试音频",
-  "clips_dir": "~/Downloads/test/slices",
-  "final_output_dir": "~/Downloads/test/results",
-  "export_dir": "~/Downloads/test/export",
-  "downloads_dir": "~/Downloads/test/packages",
+  "raw_audio_dir": "input",
+  "clips_dir": "workspaces/slices",
+  "final_output_dir": "workspaces/results",
+  "export_dir": "workspaces/export",
+  "downloads_dir": "~/Downloads/music_classifier_packages",
   "gemini_uploads_dir": "output/gemini_uploads",
   "gemini_model": "gemini-3.1-pro-preview",
   "gemini_timeout_sec": 180,
+  "gemini_retry_count": 1,
   "enable_prompt_cache": true,
   "prompt_cache_ttl_sec": 86400,
   "categories": [
     {
       "id": "lyrical",
       "name": "抒情",
-      "description": "叙事、情绪、柔和旋律、慢歌舒缓。",
+      "description": "整体以情绪表达、叙事、柔和旋律为主。节奏不抢，律动不强，听感偏舒缓、深情、慢歌、抒发型。只有在人声高音爆发不构成主要记忆点、节奏推进不明显时，才归为抒情。如果片段虽然速度慢但副歌高音爆发明显，应优先归为高音。如果鼓点、律动、速度感和推进感明显，应优先归为中速快歌。",
       "priority": 3
     },
     {
       "id": "high_note",
       "name": "高音",
-      "description": "人声高音、强声、爆发、飙唱、高潮感。",
+      "description": "片段的主要记忆点是人声往上顶、强声、高音区、爆发、飙唱、高潮感。优先级最高。即使整体速度慢、伴奏柔和、歌曲风格偏抒情，只要当前片段的核心听感是高音爆发、强声持续、音区明显上升或情绪强度突然拉高，就归为高音。不要因为歌曲整体是慢歌就归为抒情。如果只是轻微抬高、柔和假声、没有爆发记忆点，不归为高音。",
       "priority": 1
     },
     {
       "id": "mid_fast",
-      "name": "中速",
-      "description": "鼓点律动推进明显，速度感和动感强。",
+      "name": "中速快歌",
+      "description": "节奏、律动、鼓点、推进感明显。听感不沉，有稳定动感、速度感、流行快歌感。不要求 BPM 很快，只要片段主要记忆点是节奏推进、律动、鼓点和身体跟随感，就归为中速快歌。如果只是伴奏稍微有节奏，但人声核心是高音爆发，优先归为高音。如果节奏存在但整体仍是慢速叙事、情绪铺垫，没有明显推进感，归为抒情。",
       "priority": 2
     }
   ]

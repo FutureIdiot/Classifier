@@ -25,6 +25,17 @@ def require_binary(name: str) -> None:
         raise RuntimeError(f"找不到 {name}，请先安装并加入 PATH。")
 
 
+def run_audio_command(command: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=True,
+    )
+
+
 def get_audio_duration(audio_path: Path) -> float:
     require_binary("ffprobe")
     command = [
@@ -37,7 +48,7 @@ def get_audio_duration(audio_path: Path) -> float:
         "default=noprint_wrappers=1:nokey=1",
         str(audio_path),
     ]
-    result = subprocess.run(command, capture_output=True, text=True, check=True)
+    result = run_audio_command(command)
     return round(float(result.stdout.strip()), 3)
 
 
@@ -67,7 +78,7 @@ def create_gemini_upload_audio(source_path: Path, target_path: Path) -> Path:
         "96k",
         str(target_path),
     ]
-    subprocess.run(command, capture_output=True, text=True, check=True)
+    run_audio_command(command)
     return target_path
 
 
@@ -106,7 +117,7 @@ def clip_audio(
         "pcm_s16le",
         str(clip_path),
     ]
-    subprocess.run(command, capture_output=True, text=True, check=True)
+    run_audio_command(command)
     return round(duration, 1)
 
 

@@ -60,8 +60,14 @@ def ensure_directories(config: AppConfig) -> None:
         config.downloads_dir,
         config.gemini_uploads_dir,
     ]:
-        resolve_project_path(path_value).mkdir(parents=True, exist_ok=True)
-    (ROOT / "data").mkdir(parents=True, exist_ok=True)
+        try:
+            resolve_project_path(path_value).mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+    try:
+        (ROOT / "data").mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
 
 
 def load_app_config() -> AppConfig:
@@ -122,19 +128,34 @@ def default_categories() -> list[CategoryConfig]:
         CategoryConfig(
             id="lyrical",
             name="抒情",
-            description="整体以情绪表达、叙事、柔和旋律为主。节奏不抢，律动不强，人声不以炫技高音为核心，听感偏舒缓、深情、慢歌、抒发型。",
+            description=(
+                "整体以情绪表达、叙事、柔和旋律为主。节奏不抢，律动不强，听感偏舒缓、深情、慢歌、抒发型。"
+                "只有在人声高音爆发不构成主要记忆点、节奏推进不明显时，才归为抒情。"
+                "如果片段虽然速度慢但副歌高音爆发明显，应优先归为高音。"
+                "如果鼓点、律动、速度感和推进感明显，应优先归为中速快歌。"
+            ),
             priority=3,
         ),
         CategoryConfig(
             id="high_note",
             name="高音",
-            description="片段的主要记忆点是人声往上顶、强声、高音区、爆发、飙唱、高潮感。即使整体是抒情歌，只要这个片段的核心听感是高音爆发，也归为高音。",
+            description=(
+                "片段的主要记忆点是人声往上顶、强声、高音区、爆发、飙唱、高潮感。"
+                "优先级最高。即使整体速度慢、伴奏柔和、歌曲风格偏抒情，只要当前片段的核心听感是高音爆发、"
+                "强声持续、音区明显上升或情绪强度突然拉高，就归为高音。不要因为歌曲整体是慢歌就归为抒情。"
+                "如果只是轻微抬高、柔和假声、没有爆发记忆点，不归为高音。"
+            ),
             priority=1,
         ),
         CategoryConfig(
             id="mid_fast",
             name="中速快歌",
-            description="节奏、律动、鼓点、推进感明显。听感不沉，有稳定动感、速度感、流行快歌感。未必特别快，但明显比抒情歌更有推动力。",
+            description=(
+                "节奏、律动、鼓点、推进感明显。听感不沉，有稳定动感、速度感、流行快歌感。"
+                "不要求 BPM 很快，只要片段主要记忆点是节奏推进、律动、鼓点和身体跟随感，就归为中速快歌。"
+                "如果只是伴奏稍微有节奏，但人声核心是高音爆发，优先归为高音。"
+                "如果节奏存在但整体仍是慢速叙事、情绪铺垫，没有明显推进感，归为抒情。"
+            ),
             priority=2,
         ),
     ]

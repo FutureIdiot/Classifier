@@ -15,7 +15,7 @@ from src.audio_utils import (
     stable_track_id,
 )
 from src.config import ERRORS_PATH, append_jsonl, resolve_project_path, save_app_config, save_results
-from src.gemini_client import GeminiClient
+from src.gemini_client import GeminiClient, GeminiRetryableError
 from src.models import AppConfig, CategoryConfig, ClipRecord, GeminiSegment, ResultsState
 from src.prompt_builder import build_prompt, build_static_prompt_context, build_track_prompt, prompt_cache_hash
 
@@ -72,13 +72,15 @@ def analyze_tracks(
             upload_audio_path = prepare_gemini_upload_audio(audio_path, track_id, config, progress)
             fallback_prompt = build_prompt(track_id, config.categories)
             prompt = build_track_prompt(track_id, config.categories) if cached_content_name else fallback_prompt
-            gemini_result = client.analyze_audio(
-                upload_audio_path,
-                prompt,
-                track_id,
-                progress,
+            gemini_result = analyze_audio_with_retries(
+                client=client,
+                audio_path=upload_audio_path,
+                prompt=prompt,
+                track_id=track_id,
+                progress=progress,
                 cached_content_name=cached_content_name,
                 fallback_prompt=fallback_prompt if cached_content_name else None,
+                retry_count=config.gemini_retry_count,
             )
             emit(progress, f"Gemini 返回 {len(gemini_result.segments)} 个片段：{audio_path.name}")
             for seg_index, segment in enumerate(gemini_result.segments, start=1):
@@ -122,9 +124,41 @@ def analyze_tracks(
             save_results(state)
         success_count += 1
     emit(progress, f"处理结束：共扫描 {len(tracks)} 首，成功 {success_count}，跳过 {skipped_count}，失败 {failed_count}")
-    if failed_count:
-        raise RuntimeError(f"有 {failed_count} 首歌曲分析失败，请查看上方日志或 data/errors.jsonl。")
     return state
+
+
+def analyze_audio_with_retries(
+    client: GeminiClient,
+    audio_path: Path,
+    prompt: str,
+    track_id: str,
+    progress: ProgressCallback | None,
+    cached_content_name: str | None,
+    fallback_prompt: str | None,
+    retry_count: int,
+):
+    max_attempts = max(1, int(retry_count or 0) + 1)
+    for attempt in range(1, max_attempts + 1):
+        try:
+            if attempt > 1:
+                emit(progress, f"重试 Gemini 分析：第 {attempt} / {max_attempts} 次")
+            return client.analyze_audio(
+                audio_path,
+                prompt,
+                track_id,
+                progress,
+                cached_content_name=cached_content_name,
+                fallback_prompt=fallback_prompt,
+            )
+        except GeminiRetryableError as exc:
+            if attempt >= max_attempts:
+                raise
+            emit(progress, f"Gemini 可重试错误：{exc}")
+            emit(progress, "等待 2 秒后重试当前歌曲。")
+            import time
+
+            time.sleep(2)
+    raise RuntimeError("Gemini 分析重试流程异常结束。")
 
 
 def prepare_gemini_upload_audio(

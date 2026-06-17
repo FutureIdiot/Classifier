@@ -18,6 +18,10 @@ from src.models import GeminiTrackResult
 LogCallback = Callable[[str], None]
 
 
+class GeminiRetryableError(RuntimeError):
+    pass
+
+
 def extract_json(text: str) -> dict[str, Any]:
     stripped = text.strip()
     if stripped.startswith("```"):
@@ -138,7 +142,7 @@ class GeminiClient:
                     f"Gemini 请求超时：实际等待 {elapsed:.1f}s，异常类型 {type(exc).__name__}；"
                     "本地连接已断开，跳过远端文件清理以便立即结束。",
                 )
-                raise RuntimeError(
+                raise GeminiRetryableError(
                     f"Gemini 请求超时（配置 {self.timeout_sec}s，实际等待 {elapsed:.1f}s），"
                     "可以在配置里调大超时时间或换更快模型。"
                 ) from exc
@@ -149,7 +153,7 @@ class GeminiClient:
                     f"Gemini 流式连接被服务端断开：实际等待 {elapsed:.1f}s，异常类型 {type(exc).__name__}，{exc}",
                 )
                 if first_chunk_at is not None:
-                    raise
+                    raise GeminiRetryableError(f"Gemini 流式连接中断：{exc}") from exc
                 self._log(log, "流式请求未收到任何 chunk，切换普通生成请求重试一次。")
                 used_fallback = True
                 retry_started_at = time.monotonic()
@@ -172,7 +176,7 @@ class GeminiClient:
                         log,
                         f"普通生成请求超时：实际等待 {retry_elapsed:.1f}s，异常类型 {type(retry_exc).__name__}",
                     )
-                    raise RuntimeError(
+                    raise GeminiRetryableError(
                         f"Gemini 普通生成请求超时（配置 {self.timeout_sec}s，实际等待 {retry_elapsed:.1f}s）。"
                     ) from retry_exc
                 except Exception as retry_exc:
@@ -238,6 +242,14 @@ class GeminiClient:
             cached
             and cached.get("hash") == cache_hash
             and cached.get("model") == self.model
+            and cached.get("status") == "too_small"
+        ):
+            self._log(log, "prompt cache 已知过短，跳过创建并使用普通 prompt。")
+            return None
+        if (
+            cached
+            and cached.get("hash") == cache_hash
+            and cached.get("model") == self.model
             and cached.get("name")
         ):
             try:
@@ -266,6 +278,15 @@ class GeminiClient:
             return name
         except Exception as exc:
             self._log(log, f"prompt cache 创建失败，改用普通 prompt：{type(exc).__name__}，{exc}")
+            if "Cached content is too small" in str(exc):
+                self._save_prompt_cache_record(
+                    {
+                        "hash": cache_hash,
+                        "model": self.model,
+                        "status": "too_small",
+                        "error": str(exc),
+                    }
+                )
             return None
 
     def _load_prompt_cache_record(self) -> dict | None:

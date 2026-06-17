@@ -3,6 +3,10 @@ from __future__ import annotations
 import sys
 from src.config import load_app_config, load_results
 from src.pipeline import analyze_tracks
+from src.runtime import configure_utf8_runtime
+
+
+configure_utf8_runtime()
 
 
 def main() -> int:
