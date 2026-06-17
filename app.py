@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import html
+import json
+import shutil
 import sys
 from collections import deque
 from datetime import datetime
@@ -13,7 +15,10 @@ from nicegui import app, ui
 
 from src.audio_utils import seconds_to_mmss
 from src.config import (
+    ERRORS_PATH,
+    RAW_RESPONSES_PATH,
     ROOT,
+RESULTS_PATH,
     get_gemini_api_key,
     load_app_config,
     load_results,
@@ -46,6 +51,17 @@ analysis_started_at: datetime | None = None
 last_log_at: datetime | None = None
 run_status_label = None
 run_log_textarea = None
+EDIT_SESSION_PATH = ROOT / "data" / "edit_session.json"
+edit_session: dict | None = None
+result_filters = {
+    "search": "",
+    "label": "全部",
+    "section": "全部",
+    "status": "默认",
+    "min_confidence": 0.0,
+    "needs_review": False,
+    "sort": "confidence_desc",
+}
 
 
 def add_log(message: str) -> None:
@@ -58,9 +74,57 @@ def add_log(message: str) -> None:
 
 
 def reload_state() -> None:
-    global config, state
+    global config, edit_session, state
     config = load_app_config()
     state = load_results()
+    edit_session = load_edit_session()
+
+
+def load_edit_session() -> dict | None:
+    if EDIT_SESSION_PATH.exists():
+        try:
+            return json.loads(EDIT_SESSION_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+    return rebuild_edit_session_from_state()
+
+
+def save_edit_session(session: dict | None) -> None:
+    EDIT_SESSION_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if session is None:
+        if EDIT_SESSION_PATH.exists():
+            EDIT_SESSION_PATH.unlink()
+        return
+    EDIT_SESSION_PATH.write_text(json.dumps(session, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def rebuild_edit_session_from_state() -> dict | None:
+    editing_clips = [clip for clip in state.clips if clip.status == "editing"]
+    if not editing_clips:
+        return None
+    track_id = editing_clips[0].track_id
+    track_clips = [clip for clip in editing_clips if clip.track_id == track_id]
+    regions = [
+        {
+            "clip_id": item.clip_id,
+            "display_name": item.display_name,
+            "label": item.final_label,
+            "section": item.section,
+            "start_sec": item.start_sec,
+            "end_sec": item.end_sec,
+        }
+        for item in sorted(track_clips, key=lambda value: value.start_sec)
+    ]
+    return {
+        "track_id": track_id,
+        "source_filename": track_clips[0].source_filename,
+        "source_audio_path": track_clips[0].source_audio_path,
+        "old_status": {clip.clip_id: "confirmed" for clip in track_clips},
+        "regions": regions,
+    }
+
+
+edit_session = load_edit_session()
 
 
 @app.get("/media/{clip_id}")
@@ -88,6 +152,14 @@ def debug_clip(clip_id: str) -> JSONResponse:
 def source_media(clip_id: str, range_header: str | None = Header(default=None, alias="Range")) -> Response:
     clip = find_clip(state, clip_id)
     return audio_response(resolve_project_path(clip.source_audio_path), clip.source_filename, range_header)
+
+
+@app.get("/edit/source/{track_id}")
+def edit_source_media(track_id: str, range_header: str | None = Header(default=None, alias="Range")) -> Response:
+    source_clip = next((clip for clip in state.clips if clip.track_id == track_id), None)
+    if source_clip is None:
+        raise KeyError(f"找不到原曲：{track_id}")
+    return audio_response(resolve_project_path(source_clip.source_audio_path), source_clip.source_filename, range_header)
 
 
 def audio_response(path: Path, filename: str, range_header: str | None = None) -> Response:
@@ -143,6 +215,112 @@ async def rename_clip(request: Request) -> JSONResponse:
     return JSONResponse({"ok": True})
 
 
+@app.post("/api/batch_update_clips")
+async def batch_update_clips(request: Request) -> JSONResponse:
+    payload = await request.json()
+    clip_ids = set(payload.get("clip_ids", []))
+    action = payload.get("action", "")
+    updated = 0
+    for clip in state.clips:
+        if clip.clip_id not in clip_ids:
+            continue
+        if action == "confirm":
+            clip.status = "auto_confirmed"
+            clip.needs_review = False
+        elif action == "review":
+            clip.status = "pending_review"
+            clip.needs_review = True
+        elif action == "hide":
+            clip.status = "hidden"
+        elif action == "restore":
+            clip.status = "confirmed"
+        else:
+            continue
+        updated += 1
+    save_results(state)
+    return JSONResponse({"ok": True, "updated": updated})
+
+
+@app.post("/api/start_edit_clip")
+async def start_edit_clip(request: Request) -> JSONResponse:
+    global edit_session
+    payload = await request.json()
+    clip = find_clip(state, payload["clip_id"])
+    track_clips = [
+        item
+        for item in state.clips
+        if item.track_id == clip.track_id and item.status not in {"hidden", "replaced"}
+    ]
+    old_status = {item.clip_id: item.status for item in track_clips}
+    regions = []
+    for item in sorted(track_clips, key=lambda value: value.start_sec):
+        regions.append(
+            {
+                "clip_id": item.clip_id,
+                "display_name": item.display_name,
+                "label": item.final_label,
+                "section": item.section,
+                "start_sec": item.start_sec,
+                "end_sec": item.end_sec,
+            }
+        )
+        item.status = "editing"
+    save_results(state)
+    edit_session = {
+        "track_id": clip.track_id,
+        "source_filename": clip.source_filename,
+        "source_audio_path": clip.source_audio_path,
+        "old_status": old_status,
+        "regions": regions,
+    }
+    save_edit_session(edit_session)
+    return JSONResponse({"ok": True, "track_id": clip.track_id, "regions": regions})
+
+
+@app.post("/api/cancel_edit")
+def cancel_edit() -> JSONResponse:
+    global edit_session
+    if edit_session:
+        old_status = edit_session.get("old_status", {})
+        for clip in state.clips:
+            if clip.clip_id in old_status and clip.status == "editing":
+                clip.status = old_status[clip.clip_id]
+        save_results(state)
+        edit_session = None
+        save_edit_session(None)
+    return JSONResponse({"ok": True})
+
+
+@app.post("/api/commit_edit_regions")
+async def commit_edit_regions(request: Request) -> JSONResponse:
+    global edit_session
+    if not edit_session:
+        return JSONResponse({"ok": False, "error": "没有正在编辑的歌曲。"}, status_code=400)
+    payload = await request.json()
+    regions = payload.get("regions", [])
+    selected_clip_ids = {region.get("clip_id") for region in regions}
+    created = 0
+    for region in regions:
+        clip_id = region.get("clip_id")
+        start_sec = float(region.get("start_sec", 0))
+        end_sec = float(region.get("end_sec", 0))
+        final_label = region.get("label") or None
+        if not clip_id or end_sec <= start_sec:
+            continue
+        new_clip = recut_clip(config, state, clip_id, start_sec, end_sec, final_label)
+        new_clip.status = "manual_reviewed"
+        new_clip.display_name = region.get("display_name") or new_clip.display_name
+        new_clip.export_filename = f"{Path(new_clip.display_name).stem}.wav"
+        created += 1
+    for clip in state.clips:
+        if clip.track_id == edit_session["track_id"] and clip.status == "editing" and clip.clip_id not in selected_clip_ids:
+            clip.status = "replaced"
+    save_results(state)
+    edit_session = None
+    save_edit_session(None)
+    return JSONResponse({"ok": True, "created": created})
+
+
 @app.post("/api/update_category")
 async def api_update_category(request: Request) -> JSONResponse:
     payload = await request.json()
@@ -173,22 +351,51 @@ def download_zip() -> FileResponse:
     return FileResponse(zip_path, media_type="application/zip", filename=zip_path.name)
 
 
-def confidence_meter(value: float) -> str:
-    if value >= 0.9:
-        return "▂▄▆█"
-    if value >= 0.75:
-        return "▂▄▆"
-    if value >= 0.6:
-        return "▂▄"
-    return "▂"
-
-
 def visible_by_label() -> dict[str, list]:
     labels = [category.name for category in config.categories if category.name.strip()]
     grouped = {label: [] for label in labels}
-    for clip in visible_clips(state):
+    for clip in filtered_sorted_clips():
         grouped.setdefault(clip.final_label or "待复核", []).append(clip)
     return grouped
+
+
+def filtered_sorted_clips() -> list:
+    clips = state.clips
+    if result_filters["status"] == "默认":
+        clips = [clip for clip in clips if clip.status not in {"hidden", "replaced", "editing"}]
+    elif result_filters["status"] != "全部":
+        clips = [clip for clip in clips if clip.status == result_filters["status"]]
+
+    search = str(result_filters["search"]).strip().lower()
+    if search:
+        clips = [
+            clip
+            for clip in clips
+            if search in clip.display_name.lower()
+            or search in clip.source_filename.lower()
+            or search in clip.track_id.lower()
+        ]
+    if result_filters["label"] != "全部":
+        clips = [clip for clip in clips if clip.final_label == result_filters["label"]]
+    if result_filters["section"] != "全部":
+        clips = [clip for clip in clips if clip.section == result_filters["section"]]
+    if result_filters["needs_review"]:
+        clips = [clip for clip in clips if clip.needs_review]
+    min_confidence = float(result_filters["min_confidence"] or 0)
+    clips = [clip for clip in clips if clip.confidence >= min_confidence]
+
+    sort = result_filters["sort"]
+    if sort == "confidence_asc":
+        return sorted(clips, key=lambda clip: clip.confidence)
+    if sort == "filename":
+        return sorted(clips, key=lambda clip: (clip.source_filename, clip.start_sec))
+    if sort == "time":
+        return sorted(clips, key=lambda clip: (clip.track_id, clip.start_sec))
+    if sort == "label":
+        return sorted(clips, key=lambda clip: (clip.final_label, clip.source_filename, clip.start_sec))
+    if sort == "status":
+        return sorted(clips, key=lambda clip: (clip.status, clip.source_filename, clip.start_sec))
+    return sorted(clips, key=lambda clip: clip.confidence, reverse=True)
 
 
 def board_html() -> str:
@@ -241,6 +448,11 @@ def board_html() -> str:
     return f"""
     <div class="board-shell">
       <div class="board-actions">
+        <button class="batch-button" onclick="mcSelectVisible(true)">全选可见</button>
+        <button class="batch-button" onclick="mcSelectVisible(false)">取消选择</button>
+        <button class="batch-button" onclick="mcBatchUpdate('confirm')">批量确认</button>
+        <button class="batch-button" onclick="mcBatchUpdate('review')">标记待复核</button>
+        <button class="batch-button danger" onclick="mcBatchUpdate('hide')">隐藏</button>
         <button class="add-column" onclick="mcAddColumn()" title="添加分类列">+</button>
       </div>
       <div class="kanban-wrap" style="--visible-columns: {visible_columns};">
@@ -252,18 +464,28 @@ def board_html() -> str:
 
 def card_html(clip) -> str:
     duration = seconds_to_mmss(clip.duration_sec)
-    name = html.escape(clip.display_name)
     original = js_str(clip.display_name)
+    confidence_text = f"{clip.confidence:.2f}"
     return f"""
-    <div class="clip-row" data-clip-id="{escape_attr(clip.clip_id)}" draggable="true" ondragstart="event.dataTransfer.setData('text/plain', {js_str(clip.clip_id)})">
+    <div class="clip-row" data-clip-id="{escape_attr(clip.clip_id)}" draggable="true" ondragstart="mcDragClip(event, {js_str(clip.clip_id)})">
+      <input class="clip-check" type="checkbox" data-clip-id="{escape_attr(clip.clip_id)}" onclick="event.stopPropagation()">
       <button class="play-btn" onclick="mcPlay({js_str(clip.clip_id)})">▶</button>
+      <button class="edit-btn" onclick="mcStartEditClip({js_str(clip.clip_id)})" title="送到上方编辑区">✎</button>
       <input class="clip-name" value="{escape_attr(clip.display_name)}"
         onkeydown="mcInputKey(event, {original})"
         onblur="mcRenameClip({js_str(clip.clip_id)}, this.value)">
       <span class="clip-duration">{duration}</span>
-      <span class="confidence" title="{clip.confidence:.2f}">{confidence_meter(clip.confidence)}</span>
+      <span class="confidence" style="{confidence_style(clip.confidence)}" title="Gemini confidence">{confidence_text}</span>
     </div>
     """
+
+
+def confidence_style(value: float) -> str:
+    value = max(0.0, min(1.0, value))
+    red = (220, 38, 38)
+    blue = (37, 99, 235)
+    rgb = tuple(round(red[index] + (blue[index] - red[index]) * value) for index in range(3))
+    return f"color: rgb({rgb[0]}, {rgb[1]}, {rgb[2]}); font-weight: 700;"
 
 
 def escape_attr(value: str) -> str:
@@ -291,7 +513,9 @@ def add_styles() -> None:
           }
           .board-actions {
             display: flex;
+            gap: 8px;
             justify-content: flex-end;
+            flex-wrap: wrap;
             padding-right: 2px;
           }
           .kanban-wrap {
@@ -329,7 +553,7 @@ def add_styles() -> None:
           .clip-list { display: grid; gap: 6px; }
           .clip-row {
             display: grid;
-            grid-template-columns: 28px minmax(0, 1fr) 48px 54px;
+            grid-template-columns: 18px 28px 28px minmax(0, 1fr) 48px 44px;
             align-items: center;
             gap: 8px;
             height: 38px;
@@ -340,6 +564,11 @@ def add_styles() -> None:
             cursor: grab;
           }
           .clip-row:active { cursor: grabbing; }
+          .clip-check {
+            width: 14px;
+            height: 14px;
+            accent-color: #2563eb;
+          }
           .clip-row.is-playing {
             background: #e8f1ff;
             border-color: #2563eb;
@@ -358,6 +587,20 @@ def add_styles() -> None:
             background: #fff;
             color: #243b53;
             line-height: 1;
+          }
+          .edit-btn {
+            width: 26px;
+            height: 26px;
+            border: 1px solid #cbd2d9;
+            border-radius: 50%;
+            background: #fff;
+            color: #52606d;
+            line-height: 1;
+            font-size: 13px;
+          }
+          .edit-btn:hover {
+            border-color: #2563eb;
+            color: #2563eb;
           }
           .clip-row.is-playing .play-btn {
             border-color: #2563eb;
@@ -390,6 +633,138 @@ def add_styles() -> None:
             font-size: 26px;
             color: #334e68;
           }
+          .batch-button {
+            height: 32px;
+            border: 1px solid #cbd2d9;
+            border-radius: 6px;
+            background: #fff;
+            color: #334e68;
+            padding: 0 10px;
+            font-size: 12px;
+          }
+          .batch-button.danger {
+            color: #b42318;
+            border-color: #f2b8b5;
+          }
+          .edit-drop-zone {
+            height: 96px;
+            border: 1px dashed #9aa5b1;
+            border-radius: 8px;
+            display: grid;
+            place-items: center;
+            color: #52606d;
+            background: #fbfcfd;
+            font-size: 13px;
+          }
+          .wave-editor {
+            display: grid;
+            gap: 10px;
+            width: 100%;
+          }
+          #mc-edit-audio {
+            width: 100%;
+            height: 36px;
+          }
+          .wave-stage {
+            position: relative;
+            width: 100%;
+            height: 220px;
+            border: 1px solid #d8dde3;
+            border-radius: 8px;
+            background: #ffffff;
+            overflow: hidden;
+          }
+          #mc-wave-canvas {
+            width: 100%;
+            height: 100%;
+            display: block;
+          }
+          #mc-region-layer {
+            position: absolute;
+            inset: 0;
+          }
+          .edit-region {
+            position: absolute;
+            top: 16px;
+            height: 188px;
+            border: 1px solid rgba(37, 99, 235, 0.9);
+            background: rgba(37, 99, 235, 0.16);
+            border-radius: 6px;
+            cursor: move;
+          }
+          .edit-region .region-handle {
+            position: absolute;
+            top: 0;
+            width: 8px;
+            height: 100%;
+            background: rgba(37, 99, 235, 0.75);
+            cursor: ew-resize;
+          }
+          .edit-region .region-handle.left { left: 0; border-radius: 5px 0 0 5px; }
+          .edit-region .region-handle.right { right: 0; border-radius: 0 5px 5px 0; }
+          .edit-region .region-label {
+            position: absolute;
+            left: 10px;
+            top: 8px;
+            right: 10px;
+            overflow: hidden;
+            white-space: nowrap;
+            text-overflow: ellipsis;
+            color: #123c7c;
+            font-size: 12px;
+            font-weight: 700;
+            pointer-events: none;
+          }
+          .region-table {
+            display: flex;
+            gap: 8px;
+            overflow-x: auto;
+            padding-bottom: 4px;
+          }
+          .region-card {
+            flex: 1 0 180px;
+            min-width: 180px;
+            border: 1px solid #d8dde3;
+            border-radius: 8px;
+            background: #fff;
+            padding: 8px;
+            display: grid;
+            gap: 6px;
+            font-size: 12px;
+          }
+          .region-card.is-muted {
+            opacity: 0.45;
+          }
+          .region-card-head {
+            display: grid;
+            grid-template-columns: 18px minmax(0, 1fr);
+            gap: 6px;
+            align-items: center;
+          }
+          .region-card input,
+          .region-card select {
+            height: 28px;
+            border: 1px solid #d8dde3;
+            border-radius: 6px;
+            padding: 0 6px;
+            min-width: 0;
+          }
+          .region-time-row {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 6px;
+          }
+          .region-category-row {
+            display: grid;
+            grid-template-columns: 12px minmax(0, 1fr);
+            gap: 6px;
+            align-items: center;
+          }
+          .region-color-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 999px;
+          }
           @media (max-width: 900px) {
             .kanban-column {
               flex-basis: min(86vw, 360px);
@@ -409,6 +784,11 @@ def add_styles() -> None:
               headers: {'Content-Type': 'application/json'},
               body: JSON.stringify({clip_id: clipId, label})
             }).then(() => window.location.reload());
+          }
+          function mcDragClip(event, clipId) {
+            event.dataTransfer.effectAllowed = 'move';
+            event.dataTransfer.setData('text/plain', clipId);
+            event.dataTransfer.setData('application/x-clip-id', clipId);
           }
           function mcRenameClip(clipId, value) {
             fetch('/api/rename_clip', {
@@ -478,6 +858,245 @@ def add_styles() -> None:
               event.target.blur();
             }
           }
+          function mcSelectedClipIds() {
+            return Array.from(document.querySelectorAll('.clip-check:checked')).map(input => input.dataset.clipId);
+          }
+          function mcSelectVisible(checked) {
+            document.querySelectorAll('.clip-check').forEach(input => input.checked = checked);
+          }
+          function mcBatchUpdate(action) {
+            const clipIds = mcSelectedClipIds();
+            if (clipIds.length === 0) {
+              alert('请先勾选片段。');
+              return;
+            }
+            fetch('/api/batch_update_clips', {
+              method: 'POST',
+              headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify({clip_ids: clipIds, action})
+            }).then(() => window.location.reload());
+          }
+          function mcDropToEditor(event) {
+            event.preventDefault();
+            const clipId = event.dataTransfer.getData('application/x-clip-id') || event.dataTransfer.getData('text/plain');
+            if (!clipId) return;
+            mcStartEditClip(clipId);
+          }
+          function mcStartEditClip(clipId) {
+            fetch('/api/start_edit_clip', {
+              method: 'POST',
+              headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify({clip_id: clipId})
+            }).then(response => {
+              if (!response.ok) throw new Error('HTTP ' + response.status);
+              return response.json();
+            }).then(() => window.location.reload())
+              .catch(error => alert('进入编辑区失败：' + error.message));
+          }
+          async function mcInitWaveEditor() {
+            const root = document.getElementById('mc-editor-root');
+            if (!root || root.dataset.ready === 'true') return;
+            root.dataset.ready = 'true';
+            const audio = document.getElementById('mc-edit-audio');
+            const canvas = document.getElementById('mc-wave-canvas');
+            const layer = document.getElementById('mc-region-layer');
+            const table = document.getElementById('mc-region-table');
+            const regions = JSON.parse(root.dataset.regions || '[]');
+            const categories = JSON.parse(root.dataset.categories || '[]');
+            window.mcEditRegions = regions;
+            window.mcEditCategories = categories;
+
+            const syncDuration = () => {
+              const duration = audio.duration || Math.max(...regions.map(r => Number(r.end_sec || 0)), 1);
+              root.dataset.duration = String(duration);
+              mcRenderRegions();
+              mcRenderRegionTable();
+            };
+            audio.addEventListener('loadedmetadata', syncDuration);
+            if (audio.readyState >= 1) syncDuration();
+
+            try {
+              const response = await fetch(root.dataset.sourceUrl);
+              const buffer = await response.arrayBuffer();
+              const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+              const audioBuffer = await audioContext.decodeAudioData(buffer.slice(0));
+              mcDrawWaveform(canvas, audioBuffer);
+              if (!audio.duration) {
+                root.dataset.duration = String(audioBuffer.duration);
+                mcRenderRegions();
+                mcRenderRegionTable();
+              }
+              audioContext.close();
+            } catch (error) {
+              const ctx = canvas.getContext('2d');
+              ctx.font = '13px sans-serif';
+              ctx.fillStyle = '#b42318';
+              ctx.fillText('波形加载失败：' + error.message, 16, 32);
+            }
+
+            window.addEventListener('resize', () => {
+              if (window.mcEditRegions) mcRenderRegions();
+            });
+          }
+          function mcDrawWaveform(canvas, audioBuffer) {
+            const rect = canvas.getBoundingClientRect();
+            const width = Math.max(600, Math.floor(rect.width * window.devicePixelRatio));
+            const height = Math.max(120, Math.floor(rect.height * window.devicePixelRatio));
+            canvas.width = width;
+            canvas.height = height;
+            const ctx = canvas.getContext('2d');
+            ctx.clearRect(0, 0, width, height);
+            ctx.fillStyle = '#ffffff';
+            ctx.fillRect(0, 0, width, height);
+            ctx.strokeStyle = '#d8dde3';
+            ctx.beginPath();
+            ctx.moveTo(0, height / 2);
+            ctx.lineTo(width, height / 2);
+            ctx.stroke();
+            const data = audioBuffer.getChannelData(0);
+            const step = Math.ceil(data.length / width);
+            ctx.strokeStyle = '#52606d';
+            ctx.beginPath();
+            for (let x = 0; x < width; x++) {
+              let min = 1;
+              let max = -1;
+              const start = x * step;
+              const end = Math.min(start + step, data.length);
+              for (let i = start; i < end; i++) {
+                const value = data[i];
+                if (value < min) min = value;
+                if (value > max) max = value;
+              }
+              ctx.moveTo(x, (1 + min) * height / 2);
+              ctx.lineTo(x, (1 + max) * height / 2);
+            }
+            ctx.stroke();
+          }
+          function mcRenderRegions() {
+            const root = document.getElementById('mc-editor-root');
+            const layer = document.getElementById('mc-region-layer');
+            if (!root || !layer || !window.mcEditRegions) return;
+            const duration = Number(root.dataset.duration || 1);
+            layer.innerHTML = '';
+            window.mcEditRegions.forEach((region, index) => {
+              const left = Math.max(0, Number(region.start_sec || 0) / duration * 100);
+              const right = Math.min(100, Number(region.end_sec || 0) / duration * 100);
+              const el = document.createElement('div');
+              el.className = 'edit-region';
+              el.dataset.index = index;
+              el.style.left = left + '%';
+              el.style.width = Math.max(0.5, right - left) + '%';
+              const color = mcRegionColor(region.label, 0.9);
+              el.style.borderColor = color;
+              el.style.background = mcRegionColor(region.label, 0.18);
+              el.innerHTML = `<div class="region-handle left"></div><div class="region-label">${region.display_name || region.clip_id}</div><div class="region-handle right"></div>`;
+              el.querySelectorAll('.region-handle').forEach(handle => handle.style.background = color);
+              mcAttachRegionDrag(el, region);
+              layer.appendChild(el);
+            });
+          }
+          function mcRegionColor(label, alpha) {
+            const palette = ['37,99,235', '14,165,163', '124,58,237', '217,119,6', '5,150,105', '219,39,119'];
+            const categories = window.mcEditCategories || [];
+            const index = Math.max(0, categories.findIndex(category => category.name === label));
+            const rgb = palette[index % palette.length];
+            return `rgba(${rgb}, ${alpha})`;
+          }
+          function mcAttachRegionDrag(el, region) {
+            let mode = 'move';
+            let startX = 0;
+            let originalStart = 0;
+            let originalEnd = 0;
+            el.querySelector('.left').addEventListener('pointerdown', event => { mode = 'left'; begin(event); });
+            el.querySelector('.right').addEventListener('pointerdown', event => { mode = 'right'; begin(event); });
+            el.addEventListener('pointerdown', event => { if (!event.target.classList.contains('region-handle')) { mode = 'move'; begin(event); } });
+            function begin(event) {
+              event.preventDefault();
+              startX = event.clientX;
+              originalStart = Number(region.start_sec);
+              originalEnd = Number(region.end_sec);
+              el.setPointerCapture(event.pointerId);
+              el.addEventListener('pointermove', move);
+              el.addEventListener('pointerup', end);
+            }
+            function move(event) {
+              const root = document.getElementById('mc-editor-root');
+              const duration = Number(root.dataset.duration || 1);
+              const stage = document.querySelector('.wave-stage');
+              const delta = (event.clientX - startX) / stage.clientWidth * duration;
+              if (mode === 'left') {
+                region.start_sec = Math.max(0, Math.min(originalEnd - 1, originalStart + delta));
+              } else if (mode === 'right') {
+                region.end_sec = Math.min(duration, Math.max(originalStart + 1, originalEnd + delta));
+              } else {
+                const length = originalEnd - originalStart;
+                const nextStart = Math.max(0, Math.min(duration - length, originalStart + delta));
+                region.start_sec = nextStart;
+                region.end_sec = nextStart + length;
+              }
+              region.start_sec = Math.round(region.start_sec * 10) / 10;
+              region.end_sec = Math.round(region.end_sec * 10) / 10;
+              mcRenderRegions();
+              mcRenderRegionTable();
+            }
+            function end(event) {
+              el.releasePointerCapture(event.pointerId);
+              el.removeEventListener('pointermove', move);
+              el.removeEventListener('pointerup', end);
+            }
+          }
+          function mcRenderRegionTable() {
+            const table = document.getElementById('mc-region-table');
+            if (!table || !window.mcEditRegions) return;
+            table.innerHTML = '';
+            window.mcEditRegions.forEach((region, index) => {
+              if (region.selected === undefined) region.selected = true;
+              const card = document.createElement('div');
+              card.className = 'region-card' + (region.selected ? '' : ' is-muted');
+              card.style.borderColor = mcRegionColor(region.label, 0.55);
+              const options = (window.mcEditCategories || []).map(category => {
+                const selected = category.name === region.label ? 'selected' : '';
+                return `<option value="${category.name}" ${selected}>${category.name}</option>`;
+              }).join('');
+              card.innerHTML = `
+                <div class="region-card-head">
+                  <input type="checkbox" ${region.selected ? 'checked' : ''} onchange="window.mcEditRegions[${index}].selected=this.checked; mcRenderRegionTable();">
+                  <input value="${region.display_name || region.clip_id}" onchange="window.mcEditRegions[${index}].display_name=this.value; mcRenderRegions();">
+                </div>
+                <div class="region-time-row">
+                  <input type="number" step="0.1" value="${Number(region.start_sec).toFixed(1)}" onchange="window.mcEditRegions[${index}].start_sec=Number(this.value); mcRenderRegions();">
+                  <input type="number" step="0.1" value="${Number(region.end_sec).toFixed(1)}" onchange="window.mcEditRegions[${index}].end_sec=Number(this.value); mcRenderRegions();">
+                </div>
+                <div class="region-category-row">
+                  <span class="region-color-dot" style="background:${mcRegionColor(region.label, 0.9)}"></span>
+                  <select onchange="window.mcEditRegions[${index}].label=this.value; mcRenderRegions(); mcRenderRegionTable();">${options}</select>
+                </div>
+              `;
+              table.appendChild(card);
+            });
+          }
+          function mcCommitEditRegions() {
+            if (!window.mcEditRegions || window.mcEditRegions.length === 0) {
+              alert('没有可裁剪的片段。');
+              return;
+            }
+            const selectedRegions = window.mcEditRegions.filter(region => region.selected !== false);
+            if (selectedRegions.length === 0) {
+              alert('请至少勾选一个片段。');
+              return;
+            }
+            fetch('/api/commit_edit_regions', {
+              method: 'POST',
+              headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify({regions: selectedRegions})
+            }).then(response => {
+              if (!response.ok) throw new Error('HTTP ' + response.status);
+              return response.json();
+            }).then(data => {
+              alert('已生成 ' + data.created + ' 个新片段。');
+              window.location.reload();
+            }).catch(error => alert('重切失败：' + error.message));
+          }
         </script>
         """
     )
@@ -490,22 +1109,52 @@ def render_board() -> None:
 
 @ui.refreshable
 def render_recut_area() -> None:
-    clips = visible_clips(state)
-    options = {clip.clip_id: f"{clip.display_name} · {clip.source_filename}" for clip in clips}
+    global edit_session
+    if edit_session is None:
+        edit_session = load_edit_session()
     with ui.card().classes("w-full p-3").style("border-radius:8px"):
-        ui.label("手动裁剪").classes("text-sm font-bold")
-        if not clips:
-            ui.label("暂无片段。先分析音频后，可以在这里重新裁剪。").classes("text-xs text-gray-500")
+        with ui.row().classes("items-center justify-between w-full"):
+            ui.label("手动裁剪").classes("text-sm font-bold")
+            if edit_session:
+                with ui.row().classes("gap-2"):
+                    ui.button("取消编辑", on_click=cancel_edit_ui).props("outline")
+                    ui.button("裁剪并确认", on_click=lambda: ui.run_javascript("mcCommitEditRegions()"))
+        if not edit_session:
+            ui.html(
+                """
+                <div class="edit-drop-zone"
+                  ondragover="event.preventDefault()"
+                  ondrop="mcDropToEditor(event)">
+                  将下方任意片段拖到这里，进入整首歌重切模式
+                </div>
+                """,
+                sanitize=False,
+            )
             return
-        selected = ui.select(options=options, label="片段", value=clips[0].clip_id).props("dense outlined").classes("w-full")
-        with ui.row().classes("items-end gap-3 w-full"):
-            start_input = ui.number("start_sec", value=clips[0].start_sec, step=0.1, format="%.1f").props("dense outlined")
-            end_input = ui.number("end_sec", value=clips[0].end_sec, step=0.1, format="%.1f").props("dense outlined")
-            label_options = [category.name for category in config.categories if category.name.strip()]
-            label_select = ui.select(label_options, label="分类", value=clips[0].final_label).props("dense outlined")
-            ui.button("载入片段", on_click=lambda: load_recut_values(selected.value, start_input, end_input, label_select)).props("outline")
-            ui.button("重新裁剪", on_click=lambda: do_recut(selected.value, start_input.value, end_input.value, label_select.value))
-        ui.html(f'<audio controls style="width:100%;height:38px" src="/source/{clips[0].clip_id}"></audio>', sanitize=False)
+
+        track_id = edit_session["track_id"]
+        regions_json = json.dumps(edit_session["regions"], ensure_ascii=False)
+        categories_json = json.dumps([category.model_dump() for category in config.categories if category.name.strip()], ensure_ascii=False)
+        source_url = f"/edit/source/{track_id}"
+        ui.label(f"{edit_session['source_filename']} · {track_id}").classes("text-xs text-gray-500")
+        ui.html(
+            f"""
+            <div id="mc-editor-root" class="wave-editor"
+              data-track-id="{escape_attr(track_id)}"
+              data-source-url="{escape_attr(source_url)}"
+              data-regions="{escape_attr(regions_json)}"
+              data-categories="{escape_attr(categories_json)}">
+              <audio id="mc-edit-audio" controls src="{escape_attr(source_url)}"></audio>
+              <div class="wave-stage">
+                <canvas id="mc-wave-canvas"></canvas>
+                <div id="mc-region-layer"></div>
+              </div>
+              <div id="mc-region-table" class="region-table"></div>
+            </div>
+            """,
+            sanitize=False,
+        ).classes("w-full")
+        ui.timer(0.1, lambda: ui.run_javascript("mcInitWaveEditor()"), once=True)
 
 
 def load_recut_values(clip_id: str, start_input, end_input, label_select) -> None:
@@ -525,6 +1174,22 @@ def do_recut(clip_id: str, start_sec: float, end_sec: float, final_label: str) -
         ui.notify("已重新裁剪")
     except Exception as exc:
         ui.notify(f"重切失败：{exc}", type="negative")
+
+
+def cancel_edit_ui() -> None:
+    global edit_session
+    if edit_session:
+        old_status = edit_session.get("old_status", {})
+        for clip in state.clips:
+            if clip.clip_id in old_status and clip.status == "editing":
+                clip.status = old_status[clip.clip_id]
+        save_results(state)
+        edit_session = None
+        save_edit_session(None)
+        reload_state()
+        render_recut_area.refresh()
+        render_board.refresh()
+        ui.notify("已取消编辑")
 
 
 def render_run_panel() -> None:
@@ -567,6 +1232,118 @@ def do_scan() -> None:
     except Exception as exc:
         add_log(f"扫描失败：{exc}")
         ui.notify(f"扫描失败：{exc}", type="negative")
+
+
+@ui.refreshable
+def render_result_controls() -> None:
+    label_options = ["全部"] + [category.name for category in config.categories if category.name.strip()]
+    section_options = ["全部", "verse", "chorus", "unknown"]
+    status_options = [
+        "默认",
+        "全部",
+        "confirmed",
+        "auto_confirmed",
+        "pending_review",
+        "hidden",
+        "replaced",
+    ]
+    sort_options = {
+        "confidence_desc": "confidence 高到低",
+        "confidence_asc": "confidence 低到高",
+        "filename": "文件名",
+        "time": "片段时间",
+        "label": "分类",
+        "status": "状态",
+    }
+    with ui.card().classes("w-full p-2").style("border-radius:8px"):
+        with ui.row().classes("items-end gap-2 w-full"):
+            search = ui.input("搜索", value=result_filters["search"]).props("outlined dense clearable").classes("min-w-[220px]")
+            label_select = ui.select(label_options, label="分类", value=result_filters["label"]).props("outlined dense").classes("min-w-[140px]")
+            section_select = ui.select(section_options, label="段落", value=result_filters["section"]).props("outlined dense").classes("min-w-[120px]")
+            status_select = ui.select(status_options, label="状态", value=result_filters["status"]).props("outlined dense").classes("min-w-[140px]")
+            min_confidence = ui.number("最低分", value=result_filters["min_confidence"], min=0, max=1, step=0.05, format="%.2f").props("outlined dense").classes("w-[110px]")
+            needs_review = ui.checkbox("只看待复核", value=result_filters["needs_review"])
+            sort_select = ui.select(sort_options, label="排序", value=result_filters["sort"]).props("outlined dense").classes("min-w-[170px]")
+
+            def apply_filters() -> None:
+                result_filters["search"] = search.value or ""
+                result_filters["label"] = label_select.value or "全部"
+                result_filters["section"] = section_select.value or "全部"
+                result_filters["status"] = status_select.value or "默认"
+                result_filters["min_confidence"] = float(min_confidence.value or 0)
+                result_filters["needs_review"] = bool(needs_review.value)
+                result_filters["sort"] = sort_select.value or "confidence_desc"
+                render_board.refresh()
+                ui.notify(f"当前显示 {len(filtered_sorted_clips())} 个片段")
+
+            def reset_filters() -> None:
+                result_filters.update(
+                    {
+                        "search": "",
+                        "label": "全部",
+                        "section": "全部",
+                        "status": "默认",
+                        "min_confidence": 0.0,
+                        "needs_review": False,
+                        "sort": "confidence_desc",
+                    }
+                )
+                render_result_controls.refresh()
+                render_board.refresh()
+
+            ui.button("应用", on_click=apply_filters)
+            ui.button("重置", on_click=reset_filters).props("outline")
+        ui.label(f"当前匹配 {len(filtered_sorted_clips())} 个片段；默认状态隐藏 hidden/replaced。").classes("text-xs text-gray-500")
+
+
+def clear_data_dialog():
+    with ui.dialog() as dialog, ui.card().classes("w-[560px] max-w-full"):
+        ui.label("清除测试结果").classes("text-lg font-bold")
+        ui.label("默认只清空结果和日志，不会删除原始音频。勾选输出目录后，会删除已生成的切片、导出文件和 Gemini 上传代理。").classes("text-sm text-gray-600")
+        clear_results = ui.checkbox("清空 data/results.json", value=True)
+        clear_logs = ui.checkbox("清空 data/raw_responses.jsonl 和 data/errors.jsonl", value=True)
+        clear_outputs = ui.checkbox("删除 clips/final/export/gemini_uploads 目录内容", value=False)
+        confirm_text = ui.input("输入 CLEAR 确认").props("outlined dense").classes("w-full")
+
+        def do_clear() -> None:
+            if confirm_text.value != "CLEAR":
+                ui.notify("请输入 CLEAR 确认清除。", type="warning")
+                return
+            try:
+                if clear_results.value:
+                    RESULTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+                    RESULTS_PATH.write_text('{\n  "clips": []\n}\n', encoding="utf-8")
+                    save_edit_session(None)
+                if clear_logs.value:
+                    for path in [RAW_RESPONSES_PATH, ERRORS_PATH]:
+                        if path.exists():
+                            path.unlink()
+                if clear_outputs.value:
+                    for path_value in [
+                        config.clips_dir,
+                        config.final_output_dir,
+                        config.export_dir,
+                        config.gemini_uploads_dir,
+                    ]:
+                        directory = resolve_project_path(path_value)
+                        if directory.exists():
+                            shutil.rmtree(directory)
+                        directory.mkdir(parents=True, exist_ok=True)
+                reload_state()
+                run_logs.clear()
+                add_log("已清除测试结果。")
+                render_board.refresh()
+                render_recut_area.refresh()
+                render_result_controls.refresh()
+                dialog.close()
+                ui.notify("清除完成")
+            except Exception as exc:
+                ui.notify(f"清除失败：{exc}", type="negative")
+
+        with ui.row().classes("justify-end w-full"):
+            ui.button("取消", on_click=dialog.close).props("flat")
+            ui.button("确认清除", on_click=do_clear).props("color=negative")
+    return dialog
 
 
 def settings_dialog():
@@ -691,6 +1468,7 @@ async def request_stop() -> None:
 def main() -> None:
     add_styles()
     dialog = settings_dialog()
+    clear_dialog = clear_data_dialog()
     with ui.header().classes("items-center justify-between bg-white text-gray-900 border-b"):
         ui.label("本地音频分类工作台").classes("text-base font-bold")
         with ui.row().classes("items-center gap-2"):
@@ -705,11 +1483,13 @@ def main() -> None:
             ui.button("保存当前结果", on_click=lambda: (save_results(state), ui.notify("结果已保存"))).props("outline")
             ui.button("导出 CSV", on_click=do_export_csv).props("outline")
             ui.button("生成 ZIP", on_click=do_zip).props("outline")
+            ui.button("清除测试结果", on_click=clear_dialog.open).props("outline color=negative")
             ui.button(icon="settings", on_click=dialog.open).props("flat round")
 
     with ui.column().classes("w-full p-4 gap-4"):
         render_run_panel()
         render_recut_area()
+        render_result_controls()
         render_board()
         with ui.row().classes("w-full justify-end"):
             ui.button("生成分类文件夹", on_click=do_classified_folders).props("outline")

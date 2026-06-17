@@ -91,7 +91,7 @@ def open_folder(path: Path) -> tuple[bool, str]:
 
 
 def visible_clips(state: ResultsState) -> list[ClipRecord]:
-    return [clip for clip in state.clips if clip.status not in {"hidden", "replaced"}]
+    return [clip for clip in state.clips if clip.status not in {"hidden", "replaced", "editing"}]
 
 
 def safe_folder_name(name: str) -> str:
@@ -113,4 +113,3 @@ def unique_filename(filename: str, counter: defaultdict[str, int]) -> str:
     if count == 1:
         return f"{stem}{suffix}"
     return f"{stem}_{count:02d}{suffix}"
-
