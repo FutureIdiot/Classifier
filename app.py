@@ -806,10 +806,13 @@ def add_styles() -> None:
               audio.pause();
               return;
             }
+            const playToken = String(Date.now()) + '-' + Math.random().toString(16).slice(2);
             mcClearPlaying();
             audio.dataset.manualPause = 'false';
             audio.dataset.clipId = clipId;
+            audio.dataset.playToken = playToken;
             audio.onerror = () => {
+              if (audio.dataset.playToken !== playToken) return;
               const error = audio.error;
               const errorMap = {
                 1: 'MEDIA_ERR_ABORTED',
@@ -825,21 +828,31 @@ def add_styles() -> None:
                 '\\n请直接打开 ' + url + ' 检查接口。'
               );
             };
-            audio.src = url + '?t=' + Date.now();
+            if (audio.src !== new URL(url, window.location.href).href) {
+              audio.src = url;
+              audio.load();
+            }
             audio.play()
               .then(() => {
+                if (audio.dataset.playToken !== playToken) return;
                 if (row) {
                   row.classList.add('is-playing');
                   const button = row.querySelector('.play-btn');
                   if (button) button.textContent = '❚❚';
                 }
               })
-              .catch(error => alert(
-                '播放失败：' + error.message +
-                '\\nnetworkState=' + audio.networkState +
-                ' readyState=' + audio.readyState +
-                '\\nURL=' + url
-              ));
+              .catch(error => {
+                if (audio.dataset.playToken !== playToken) return;
+                const message = error && error.message ? error.message : '';
+                if (error && error.name === 'AbortError') return;
+                if (message.includes('interrupted by a new load request')) return;
+                alert(
+                  '播放失败：' + message +
+                  '\\nnetworkState=' + audio.networkState +
+                  ' readyState=' + audio.readyState +
+                  '\\nURL=' + url
+                );
+              });
           }
           function mcClearPlaying() {
             document.querySelectorAll('.clip-row.is-playing').forEach(row => {
