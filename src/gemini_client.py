@@ -24,6 +24,7 @@ class GeminiRetryableError(RuntimeError):
 
 
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+PROMPT_CACHE_DISABLED_STATUSES = {"too_small", "generation_failed"}
 
 
 def retryable_api_error(exc: Exception) -> bool:
@@ -105,6 +106,7 @@ class GeminiClient:
             api_key=api_key,
             http_options=types.HttpOptions(timeout=self.timeout_sec * 1000),
         )
+        self.disabled_prompt_caches: set[str] = set()
 
     def analyze_audio(
         self,
@@ -115,6 +117,9 @@ class GeminiClient:
         cached_content_name: str | None = None,
         fallback_prompt: str | None = None,
     ) -> GeminiTrackResult:
+        if cached_content_name and fallback_prompt and cached_content_name in self.disabled_prompt_caches:
+            self._log(log, "本轮已禁用 prompt cache，直接使用完整 prompt。")
+            return self.analyze_audio(audio_path, fallback_prompt, track_id, log, None, None)
         should_cleanup_upload = True
         self._log(log, f"上传音频到 Gemini：{audio_path.name}")
         try:
@@ -174,6 +179,15 @@ class GeminiClient:
                     f"Gemini 请求超时：实际等待 {elapsed:.1f}s，异常类型 {type(exc).__name__}；"
                     "本地连接已断开，跳过远端文件清理以便立即结束。",
                 )
+                if cached_content_name and fallback_prompt:
+                    return self._retry_without_prompt_cache(
+                        audio_path,
+                        fallback_prompt,
+                        track_id,
+                        log,
+                        cached_content_name,
+                        f"流式请求超时（{elapsed:.1f}s）",
+                    )
                 raise GeminiRetryableError(
                     f"Gemini 请求超时（配置 {self.timeout_sec}s，实际等待 {elapsed:.1f}s），"
                     "可以在配置里调大超时时间或换更快模型。"
@@ -208,6 +222,15 @@ class GeminiClient:
                         log,
                         f"普通生成请求超时：实际等待 {retry_elapsed:.1f}s，异常类型 {type(retry_exc).__name__}",
                     )
+                    if cached_content_name and fallback_prompt:
+                        return self._retry_without_prompt_cache(
+                            audio_path,
+                            fallback_prompt,
+                            track_id,
+                            log,
+                            cached_content_name,
+                            f"普通生成请求超时（{retry_elapsed:.1f}s）",
+                        )
                     raise GeminiRetryableError(
                         f"Gemini 普通生成请求超时（配置 {self.timeout_sec}s，实际等待 {retry_elapsed:.1f}s）。"
                     ) from retry_exc
@@ -222,8 +245,14 @@ class GeminiClient:
                     raise
             except (genai_errors.APIError, genai_errors.ClientError, genai_errors.ServerError) as exc:
                 if cached_content_name and fallback_prompt:
-                    self._log(log, f"使用 prompt cache 请求失败，切换完整 prompt 重试：{type(exc).__name__}，{exc}")
-                    return self.analyze_audio(audio_path, fallback_prompt, track_id, log, None, None)
+                    return self._retry_without_prompt_cache(
+                        audio_path,
+                        fallback_prompt,
+                        track_id,
+                        log,
+                        cached_content_name,
+                        f"{type(exc).__name__}，{exc}",
+                    )
                 elapsed = time.monotonic() - started_at
                 self._log(log, f"Gemini API 请求异常：实际等待 {elapsed:.1f}s，异常类型 {type(exc).__name__}，{exc}")
                 if retryable_api_error(exc):
@@ -231,8 +260,14 @@ class GeminiClient:
                 raise
             except Exception as exc:
                 if cached_content_name and fallback_prompt:
-                    self._log(log, f"使用 prompt cache 请求失败，切换完整 prompt 重试：{type(exc).__name__}，{exc}")
-                    return self.analyze_audio(audio_path, fallback_prompt, track_id, log, None, None)
+                    return self._retry_without_prompt_cache(
+                        audio_path,
+                        fallback_prompt,
+                        track_id,
+                        log,
+                        cached_content_name,
+                        f"{type(exc).__name__}，{exc}",
+                    )
                 elapsed = time.monotonic() - started_at
                 self._log(log, f"Gemini 流式请求异常：实际等待 {elapsed:.1f}s，异常类型 {type(exc).__name__}，{exc}")
                 raise
@@ -266,6 +301,20 @@ class GeminiClient:
         if log:
             log(message)
 
+    def _retry_without_prompt_cache(
+        self,
+        audio_path: Path,
+        fallback_prompt: str,
+        track_id: str,
+        log: LogCallback | None,
+        cached_content_name: str,
+        reason: str,
+    ) -> GeminiTrackResult:
+        self.disabled_prompt_caches.add(cached_content_name)
+        self._mark_prompt_cache_generation_failed(cached_content_name, reason)
+        self._log(log, f"使用 prompt cache 请求失败，已禁用该 cache 并切换完整 prompt 重试：{reason}")
+        return self.analyze_audio(audio_path, fallback_prompt, track_id, log, None, None)
+
     def _generation_config(self, cached_content_name: str | None = None) -> types.GenerateContentConfig:
         return types.GenerateContentConfig(
             response_mime_type="application/json",
@@ -285,9 +334,10 @@ class GeminiClient:
             cached
             and cached.get("hash") == cache_hash
             and cached.get("model") == self.model
-            and cached.get("status") == "too_small"
+            and cached.get("status") in PROMPT_CACHE_DISABLED_STATUSES
         ):
-            self._log(log, "prompt cache 已知过短，跳过创建并使用普通 prompt。")
+            reason = cached.get("error") or cached.get("status")
+            self._log(log, f"prompt cache 上次不可用，跳过创建并使用普通 prompt：{reason}")
             return None
         if (
             cached
@@ -344,6 +394,14 @@ class GeminiClient:
     def _save_prompt_cache_record(self, payload: dict) -> None:
         PROMPT_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
         PROMPT_CACHE_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _mark_prompt_cache_generation_failed(self, cached_content_name: str, reason: str) -> None:
+        record = self._load_prompt_cache_record() or {}
+        if record.get("name") != cached_content_name:
+            return
+        record["status"] = "generation_failed"
+        record["error"] = reason
+        self._save_prompt_cache_record(record)
 
     def _verify_uploaded_file(self, file_name: str, log: LogCallback | None) -> None:
         if not file_name:
