@@ -36,9 +36,19 @@ def analyze_tracks(
     progress: ProgressCallback | None = None,
     should_stop: StopCallback | None = None,
     force_reanalyze: bool = False,
+    retry_track_ids: set[str] | None = None,
 ) -> ResultsState:
     raw_root = resolve_project_path(config.raw_audio_dir)
-    tracks = scan_tracks(config)
+    scanned_tracks = scan_tracks(config)
+    if retry_track_ids is None:
+        tracks = scanned_tracks
+    else:
+        tracks = [path for path in scanned_tracks if stable_track_id(path, raw_root) in retry_track_ids]
+        found_track_ids = {stable_track_id(path, raw_root) for path in tracks}
+        missing_track_ids = sorted(retry_track_ids - found_track_ids)
+        if missing_track_ids:
+            emit(progress, f"选择重试中有 {len(missing_track_ids)} 首不在 input 中，已跳过：{', '.join(missing_track_ids[:8])}")
+        emit(progress, f"只重试已选择失败音频：{len(tracks)} / {len(scanned_tracks)} 个音频文件")
     emit(progress, f"开始分析队列：{len(tracks)} 个音频文件，目录 {raw_root}")
     client = GeminiClient(config.gemini_model, config.gemini_timeout_sec)
     cached_content_name = None

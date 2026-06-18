@@ -131,6 +131,28 @@ function mcClearPlaying() {
   const audio = document.getElementById('mc-global-audio');
   if (audio) audio.dataset.clipId = '';
 }
+function mcResetRuntimeState() {
+  mcClearPlaying();
+  const globalAudio = document.getElementById('mc-global-audio');
+  if (globalAudio) {
+    globalAudio.pause();
+    globalAudio.removeAttribute('src');
+    globalAudio.load();
+    globalAudio.dataset.clipId = '';
+    globalAudio.dataset.playToken = '';
+  }
+  const editAudio = document.getElementById('mc-edit-audio');
+  if (editAudio) {
+    editAudio.pause();
+    editAudio.removeAttribute('src');
+    editAudio.load();
+  }
+  window.mcEditRegions = null;
+  window.mcEditCategories = null;
+  document.querySelectorAll('#mc-editor-root').forEach(root => {
+    root.dataset.ready = 'false';
+  });
+}
 function mcAddColumn() {
   fetch('/api/add_category', {method: 'POST'}).then(() => window.location.reload());
 }

@@ -59,6 +59,7 @@ def sync_classified_folders(state: ResultsState, config: AppConfig) -> Path:
     manifest = load_manifest(final_dir)
     used_names: dict[Path, set[str]] = {}
     replaceable_targets = replaceable_output_paths(state, final_dir, manifest)
+    visible_ids = {clip.clip_id for clip in visible_clips(state)}
 
     for clip in visible_clips(state):
         sync_classified_clip(
@@ -69,6 +70,7 @@ def sync_classified_folders(state: ResultsState, config: AppConfig) -> Path:
             replaceable_targets=replaceable_targets,
             save_manifest_file=False,
         )
+    prune_inactive_manifest_outputs(final_dir, manifest, visible_ids)
     save_manifest(final_dir, manifest)
     return final_dir
 
@@ -79,6 +81,7 @@ def sync_track_classified_folders(state: ResultsState, config: AppConfig, track_
     manifest = load_manifest(final_dir)
     used_names: dict[Path, set[str]] = {}
     replaceable_targets = replaceable_output_paths(state, final_dir, manifest)
+    visible_ids = {clip.clip_id for clip in visible_clips(state)}
     for clip in visible_clips(state):
         if clip.track_id == track_id:
             sync_classified_clip(
@@ -89,6 +92,7 @@ def sync_track_classified_folders(state: ResultsState, config: AppConfig, track_
                 replaceable_targets=replaceable_targets,
                 save_manifest_file=False,
             )
+    prune_inactive_manifest_outputs(final_dir, manifest, visible_ids)
     save_manifest(final_dir, manifest)
     return final_dir
 
@@ -164,6 +168,7 @@ def sync_classified_clip(
         "export_filename": filename,
         "clip_path": clip.clip_path,
     }
+    remove_unowned_same_filename_outputs(final_dir, filename, target_path, manifest)
     if save_manifest_file:
         save_manifest(final_dir, manifest)
     return target_path
@@ -209,6 +214,43 @@ def remove_stale_owned_output(old_path: Path | None, new_path: Path) -> None:
         old_path.unlink()
     except OSError:
         pass
+
+
+def prune_inactive_manifest_outputs(final_dir: Path, manifest: dict[str, dict[str, str]], visible_clip_ids: set[str]) -> None:
+    for clip_id in list(manifest):
+        if clip_id in visible_clip_ids:
+            continue
+        target = final_dir / str(manifest.get(clip_id, {}).get("target_path") or "")
+        remove_stale_owned_output(target, final_dir / MANIFEST_NAME)
+        manifest.pop(clip_id, None)
+
+
+def remove_unowned_same_filename_outputs(
+    final_dir: Path,
+    filename: str,
+    current_path: Path,
+    manifest: dict[str, dict[str, str]],
+) -> None:
+    owned_paths = {
+        (final_dir / str(entry.get("target_path") or "")).resolve()
+        for entry in manifest.values()
+        if entry.get("target_path")
+    }
+    try:
+        current_resolved = current_path.resolve()
+    except OSError:
+        current_resolved = current_path
+    for candidate in final_dir.glob(f"*/{filename}"):
+        try:
+            candidate_resolved = candidate.resolve()
+        except OSError:
+            candidate_resolved = candidate
+        if candidate_resolved == current_resolved or candidate_resolved in owned_paths:
+            continue
+        try:
+            candidate.unlink()
+        except OSError:
+            pass
 
 
 def build_zip(state: ResultsState, config: AppConfig) -> Path:

@@ -23,6 +23,7 @@ from src.config import (
     RAW_RESPONSES_PATH,
     ROOT,
     RESULTS_PATH,
+    append_jsonl,
     get_gemini_api_key,
     load_app_config,
     load_completed_tracks,
@@ -64,6 +65,7 @@ analysis_started_at: datetime | None = None
 last_log_at: datetime | None = None
 run_status_label = None
 run_log_textarea = None
+progress_label_widget = None
 waveform_cache: dict[str, tuple[int, int, str]] = {}
 EDIT_SESSION_PATH = ROOT / "data" / "edit_session.json"
 edit_session_store = EditSessionStore(EDIT_SESSION_PATH)
@@ -660,8 +662,8 @@ def api_add_category() -> JSONResponse:
 
 
 def add_styles() -> None:
-    ui.add_head_html('<link rel="stylesheet" href="/static/app.css?v=20260618c">')
-    ui.add_body_html('<script src="/static/app.js?v=20260618c"></script>')
+    ui.add_head_html('<link rel="stylesheet" href="/static/app.css?v=20260618d">')
+    ui.add_body_html('<script src="/static/app.js?v=20260618d"></script>')
 
 @ui.refreshable
 def render_board() -> None:
@@ -829,11 +831,12 @@ def token_value(value: int) -> str:
     return f"{value:,}" if value else "-"
 
 
-def load_failed_audio_records() -> list[dict[str, str]]:
+def load_failed_audio_records() -> list[dict[str, Any]]:
     if not ERRORS_PATH.exists():
         return []
     successful_tracks = {clip.track_id for clip in state.clips if clip.status not in {"hidden", "replaced", "editing"}}
-    latest_by_key: dict[tuple[str, str, str], dict[str, str]] = {}
+    latest_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
+    abandoned_by_key: dict[tuple[str, str, str], str] = {}
     with ERRORS_PATH.open("r", encoding="utf-8") as handle:
         for line in handle:
             try:
@@ -841,23 +844,37 @@ def load_failed_audio_records() -> list[dict[str, str]]:
             except json.JSONDecodeError:
                 continue
             kind = str(record.get("kind") or "")
+            if kind == "failure_abandoned":
+                failed_kind = str(record.get("failed_kind") or "track_failed")
+                track_id = str(record.get("track_id") or "")
+                source_path = str(record.get("source_audio_path") or "")
+                abandoned_by_key[(failed_kind, track_id, source_path)] = str(record.get("time") or "")
+                continue
             if kind not in {"track_failed", "segment_failed"}:
                 continue
             track_id = str(record.get("track_id") or "")
             if kind == "track_failed" and track_id in successful_tracks:
                 continue
             source_path = str(record.get("source_audio_path") or "")
+            retryable = kind == "track_failed" and source_path and resolve_project_path(source_path).exists()
             key = (kind, track_id, source_path)
             latest_by_key[key] = {
                 "time": str(record.get("time") or ""),
+                "failure_kind": kind,
                 "kind": "整首失败" if kind == "track_failed" else "片段失败",
                 "track_id": track_id or "-",
                 "source_audio_path": source_path,
                 "source_name": Path(source_path).name if source_path else "-",
                 "error": compact_error(str(record.get("error") or "")),
-                "retryable": "是" if kind == "track_failed" and source_path and resolve_project_path(source_path).exists() else "否",
+                "retryable": "是" if retryable else "否",
+                "retryable_bool": retryable,
             }
-    return sorted(latest_by_key.values(), key=lambda item: item["time"], reverse=True)
+    failures = [
+        item
+        for key, item in latest_by_key.items()
+        if abandoned_by_key.get(key, "") < item["time"]
+    ]
+    return sorted(failures, key=lambda item: item["time"], reverse=True)
 
 
 def compact_error(error: str, limit: int = 180) -> str:
@@ -872,19 +889,76 @@ def render_failure_panel() -> None:
     failures = load_failed_audio_records()
     if not failures:
         return
+    selectable: list[tuple[dict[str, Any], Any]] = []
+
+    async def retry_selected() -> None:
+        selected = [item for item, checkbox in selectable if checkbox.value and item["retryable_bool"]]
+        if not selected:
+            ui.notify("请先勾选可重试的整首失败音频。", type="warning")
+            return
+        await retry_failed_items(selected)
+
+    def abandon_selected() -> None:
+        selected = [item for item, checkbox in selectable if checkbox.value]
+        if not selected:
+            ui.notify("请先勾选要放弃的失败记录。", type="warning")
+            return
+        abandon_failed_items(selected)
+
     with ui.card().classes("w-full p-2").style("border-radius:8px"):
         with ui.row().classes("items-center justify-between w-full"):
             ui.label(f"失败音频 {len(failures)}").classes("text-sm font-bold text-red-700")
-            ui.label("点击顶部“重试失败音频”会重新扫描 input，已成功歌曲会跳过。").classes("text-xs text-gray-500")
+            with ui.row().classes("items-center gap-2"):
+                ui.label("勾选后只重试选中的整首失败；不需要的记录可放弃。").classes("text-xs text-gray-500")
+                ui.button("重试选中", on_click=retry_selected).props("outline color=warning dense")
+                ui.button("放弃选中", on_click=abandon_selected).props("outline dense")
         for item in failures[:12]:
+            async def retry_one(item: dict[str, Any] = item) -> None:
+                await retry_failed_items([item])
+
+            def abandon_one(item: dict[str, Any] = item) -> None:
+                abandon_failed_items([item])
+
             with ui.column().classes("w-full gap-0 border-t border-gray-200 py-2"):
                 with ui.row().classes("items-center gap-2 w-full"):
+                    checkbox = ui.checkbox(value=False).props("dense")
+                    selectable.append((item, checkbox))
                     ui.label(item["source_name"]).classes("text-sm font-bold")
                     ui.label(item["kind"]).classes("text-xs text-red-700")
                     ui.label(f"track={item['track_id']}").classes("text-xs text-gray-500")
                     ui.label(f"可重试={item['retryable']}").classes("text-xs text-gray-500")
                     ui.label(item["time"]).classes("text-xs text-gray-500")
+                    if item["retryable_bool"]:
+                        ui.button("重试", on_click=retry_one).props("outline color=warning dense")
+                    ui.button("放弃", on_click=abandon_one).props("outline dense")
                 ui.label(item["error"] or "未知错误").classes("text-xs text-gray-700")
+
+
+async def retry_failed_items(items: list[dict[str, Any]]) -> None:
+    track_ids = {str(item["track_id"]) for item in items if item.get("retryable_bool") and item.get("track_id") != "-"}
+    if not track_ids:
+        ui.notify("没有可重试的失败音频。", type="warning")
+        return
+    add_log(f"准备重试选中的失败音频：{', '.join(sorted(track_ids))}")
+    await do_analyze(progress_label_widget, retry_track_ids=track_ids)
+
+
+def abandon_failed_items(items: list[dict[str, Any]]) -> None:
+    for item in items:
+        append_jsonl(
+            ERRORS_PATH,
+            {
+                "time": datetime.now().isoformat(timespec="seconds"),
+                "kind": "failure_abandoned",
+                "failed_kind": item.get("failure_kind") or "track_failed",
+                "track_id": item.get("track_id") if item.get("track_id") != "-" else "",
+                "source_audio_path": item.get("source_audio_path") or "",
+                "source_name": item.get("source_name") or "",
+            },
+        )
+    add_log(f"已放弃 {len(items)} 条失败记录。")
+    render_failure_panel.refresh()
+    ui.notify("已放弃所选失败记录。")
 
 
 @ui.refreshable
@@ -1209,14 +1283,32 @@ def settings_dialog():
     return dialog
 
 
-async def do_analyze(progress_label, force_reanalyze: bool = False) -> None:
+def prepare_analysis_run() -> None:
+    global edit_session
+    if edit_session:
+        old_status = edit_session.get("old_status", {})
+        for clip in state.clips:
+            if clip.clip_id in old_status and clip.status == "editing":
+                clip.status = old_status[clip.clip_id]
+        save_results(state)
+        edit_session = None
+        save_edit_session(None)
+    waveform_cache.clear()
+
+
+async def do_analyze(progress_label=None, force_reanalyze: bool = False, retry_track_ids: set[str] | None = None) -> None:
     global analysis_process, analysis_started_at, processing, progress_text
     if processing:
         return
     processing = True
+    prepare_analysis_run()
+    ui.run_javascript("if (window.mcResetRuntimeState) window.mcResetRuntimeState();")
     analysis_started_at = datetime.now()
     progress_text = "准备分析..."
-    add_log("开始 Gemini 分析" + ("（重新分析已完成文件）" if force_reanalyze else ""))
+    if retry_track_ids:
+        add_log(f"开始 Gemini 分析（只重试 {len(retry_track_ids)} 首失败音频）")
+    else:
+        add_log("开始 Gemini 分析" + ("（重新分析已完成文件）" if force_reanalyze else ""))
     try:
         analysis_process = await asyncio.create_subprocess_exec(
             sys.executable,
@@ -1230,6 +1322,7 @@ async def do_analyze(progress_label, force_reanalyze: bool = False) -> None:
                 "PYTHONIOENCODING": "utf-8",
                 "PYTHONLEGACYWINDOWSSTDIO": "0",
                 "MUSIC_CLASSIFIER_FORCE_REANALYZE": "1" if force_reanalyze else "0",
+                "MUSIC_CLASSIFIER_RETRY_TRACK_IDS": json.dumps(sorted(retry_track_ids), ensure_ascii=False) if retry_track_ids else "",
             },
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
@@ -1276,7 +1369,8 @@ async def do_analyze(progress_label, force_reanalyze: bool = False) -> None:
         analysis_started_at = None
         processing = False
         progress_text = "就绪"
-        progress_label.text = progress_text
+        if progress_label is not None:
+            progress_label.text = progress_text
 
 
 async def prompt_or_start_analyze(progress_label) -> None:
@@ -1333,6 +1427,7 @@ async def request_stop() -> None:
 
 
 def main() -> None:
+    global progress_label_widget
     add_styles()
     sync_outputs("startup")
     dialog = settings_dialog()
@@ -1341,9 +1436,10 @@ def main() -> None:
         ui.label("本地音频分类工作台").classes("text-base font-bold")
         with ui.row().classes("items-center gap-2"):
             progress_label = ui.label(progress_text).classes("text-xs text-gray-500")
+            progress_label_widget = progress_label
             ui.timer(0.5, lambda: (progress_label.set_text(progress_text), update_run_widgets()))
             ui.timer(3.0, render_token_usage_panel.refresh)
-            ui.timer(3.0, render_failure_panel.refresh)
+            ui.timer(3.0, lambda: None if processing else render_failure_panel.refresh())
             async def start_analyze_click() -> None:
                 await prompt_or_start_analyze(progress_label)
 
