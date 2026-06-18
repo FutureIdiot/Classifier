@@ -15,7 +15,7 @@ from src.audio_utils import (
     scan_audio_files,
     stable_track_id,
 )
-from src.config import ERRORS_PATH, append_jsonl, resolve_project_path, save_app_config, save_results
+from src.config import ERRORS_PATH, append_jsonl, load_completed_tracks, resolve_project_path, save_app_config, save_results
 from src.export_utils import sync_classified_clip, sync_track_classified_folders
 from src.gemini_client import GeminiClient, GeminiRetryableError
 from src.models import AppConfig, CategoryConfig, ClipRecord, GeminiSegment, ResultsState
@@ -35,6 +35,7 @@ def analyze_tracks(
     state: ResultsState,
     progress: ProgressCallback | None = None,
     should_stop: StopCallback | None = None,
+    force_reanalyze: bool = False,
 ) -> ResultsState:
     raw_root = resolve_project_path(config.raw_audio_dir)
     tracks = scan_tracks(config)
@@ -53,6 +54,7 @@ def analyze_tracks(
     else:
         emit(progress, "prompt cache 已关闭，使用完整 prompt。")
     known_track_ids = {clip.track_id for clip in state.clips if clip.status != "replaced"}
+    completed_tracks = load_completed_tracks().get("tracks", {})
     success_count = 0
     skipped_count = 0
     failed_count = 0
@@ -64,6 +66,12 @@ def analyze_tracks(
         track_id = stable_track_id(audio_path, raw_root)
         emit(progress, f"正在处理第 {index} / {len(tracks)} 首：{audio_path.name}")
         try:
+            if track_id in completed_tracks and not force_reanalyze:
+                emit(progress, f"跳过已完成歌曲：{audio_path.name}（如需重跑，请在页面确认重新分析）")
+                archive_successful_audio_source(audio_path, raw_root, track_id, config, state, progress)
+                save_results(state)
+                skipped_count += 1
+                continue
             if track_id in known_track_ids:
                 emit(progress, f"跳过已分析歌曲：{audio_path.name}")
                 archive_successful_audio_source(audio_path, raw_root, track_id, config, state, progress)

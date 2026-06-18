@@ -17,7 +17,7 @@ from fastapi import Header, Request
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from nicegui import app, ui
 
-from src.audio_utils import seconds_to_mmss
+from src.audio_utils import seconds_to_mmss, stable_track_id
 from src.config import (
     ERRORS_PATH,
     PROMPT_CACHE_PATH,
@@ -26,9 +26,11 @@ from src.config import (
     RESULTS_PATH,
     get_gemini_api_key,
     load_app_config,
+    load_completed_tracks,
     load_results,
     resolve_project_path,
     save_app_config,
+    save_completed_tracks,
     save_gemini_api_key,
     save_results,
 )
@@ -37,6 +39,7 @@ from src.gemini_client import list_available_gemini_models
 from src.models import AppConfig, ResultsState
 from src.pipeline import (
     add_category,
+    archive_successful_audio_source,
     find_clip,
     prune_empty_categories,
     recut_clip,
@@ -482,9 +485,13 @@ async def rename_clip(request: Request) -> JSONResponse:
 
 @app.post("/api/batch_update_clips")
 async def batch_update_clips(request: Request) -> JSONResponse:
+    global state, edit_session
     payload = await request.json()
-    clip_ids = set(payload.get("clip_ids", []))
     action = payload.get("action", "")
+    if action == "confirm":
+        clip_ids = {clip.clip_id for clip in visible_clips(state)}
+    else:
+        clip_ids = set(payload.get("clip_ids", []))
     updated = 0
     for clip in state.clips:
         if clip.clip_id not in clip_ids:
@@ -503,8 +510,12 @@ async def batch_update_clips(request: Request) -> JSONResponse:
             continue
         updated += 1
     save_results(state)
-    sync_outputs("batch_update_clips")
-    return JSONResponse({"ok": True, "updated": updated})
+    finalized = False
+    if action == "confirm" and updated:
+        finalized = finalize_current_batch()
+    else:
+        sync_outputs("batch_update_clips")
+    return JSONResponse({"ok": True, "updated": updated, "finalized": finalized})
 
 
 @app.post("/api/start_edit_clip")
@@ -729,8 +740,7 @@ def board_html() -> str:
       <div class="board-actions">
         <button class="batch-button" onclick="mcSelectVisible(true)">全选可见</button>
         <button class="batch-button" onclick="mcSelectVisible(false)">取消选择</button>
-        <button class="batch-button" onclick="mcBatchUpdate('confirm')">批量确认</button>
-        <button class="batch-button" onclick="mcBatchUpdate('review')">标记待复核</button>
+        <button class="batch-button" onclick="mcBatchUpdate('confirm')">完成任务并清空</button>
         <button class="batch-button danger" onclick="mcBatchUpdate('hide')">隐藏</button>
         <button class="add-column" onclick="mcAddColumn()" title="添加分类列">+</button>
       </div>
@@ -1230,13 +1240,19 @@ def add_styles() -> None:
           function mcSelectedClipIds() {
             return Array.from(document.querySelectorAll('.clip-check:checked')).map(input => input.dataset.clipId);
           }
+          function mcVisibleClipIds() {
+            return Array.from(document.querySelectorAll('.clip-row')).map(row => row.dataset.clipId).filter(Boolean);
+          }
           function mcSelectVisible(checked) {
             document.querySelectorAll('.clip-check').forEach(input => input.checked = checked);
           }
           function mcBatchUpdate(action) {
-            const clipIds = mcSelectedClipIds();
+            let clipIds = mcSelectedClipIds();
+            if (action === 'confirm') {
+              clipIds = mcVisibleClipIds();
+            }
             if (clipIds.length === 0) {
-              alert('请先勾选片段。');
+              alert(action === 'confirm' ? '当前没有可完成的片段。' : '请先勾选片段。');
               return;
             }
             fetch('/api/batch_update_clips', {
@@ -1786,6 +1802,101 @@ def sync_outputs(reason: str = "") -> Path | None:
         return None
 
 
+def finalize_current_batch() -> bool:
+    global edit_session, state
+    clips = visible_clips(state)
+    if not clips:
+        return False
+    if sync_outputs("finalize") is None:
+        add_log("完成失败：分类结果文件夹同步失败，页面记录未清空。")
+        return False
+    missing_outputs = missing_classified_outputs(clips)
+    if missing_outputs:
+        preview = "、".join(missing_outputs[:6])
+        suffix = f" 等 {len(missing_outputs)} 个片段" if len(missing_outputs) > 6 else ""
+        add_log(f"完成失败：仍有片段未写入结果文件夹，页面记录未清空：{preview}{suffix}")
+        return False
+    record_completed_tracks(clips)
+    archive_completed_input_files({clip.track_id for clip in clips})
+    state = ResultsState()
+    save_results(state)
+    edit_session = None
+    save_edit_session(None)
+    waveform_cache.clear()
+    add_log(f"已完成并清空页面记录：{len(clips)} 个片段。分类结果文件夹已保留。")
+    return True
+
+
+def missing_classified_outputs(clips) -> list[str]:
+    final_dir = resolve_project_path(config.final_output_dir)
+    manifest_path = final_dir / ".classified_manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
+    except (OSError, json.JSONDecodeError):
+        manifest = {}
+    missing = []
+    for clip in clips:
+        entry = manifest.get(clip.clip_id)
+        if not isinstance(entry, dict) or not entry.get("target_path"):
+            missing.append(clip.display_name or clip.export_filename or clip.clip_id)
+            continue
+        output_path = final_dir / entry["target_path"]
+        if not output_path.exists():
+            missing.append(clip.display_name or clip.export_filename or clip.clip_id)
+    return missing
+
+
+def record_completed_tracks(clips) -> None:
+    payload = load_completed_tracks()
+    tracks = payload.setdefault("tracks", {})
+    completed_at = datetime.now().isoformat(timespec="seconds")
+    for track_id in sorted({clip.track_id for clip in clips}):
+        track_clips = [clip for clip in clips if clip.track_id == track_id]
+        source_info = find_existing_source_audio(track_id, track_clips[0])
+        source_filename = source_info[1] if source_info else track_clips[0].source_filename
+        source_audio_path = source_info[2] if source_info else track_clips[0].source_audio_path
+        tracks[track_id] = {
+            "track_id": track_id,
+            "source_filename": source_filename,
+            "source_audio_path": source_audio_path,
+            "completed_at": completed_at,
+            "clip_count": len(track_clips),
+            "labels": sorted({clip.final_label for clip in track_clips if clip.final_label}),
+        }
+    save_completed_tracks(payload)
+
+
+def archive_completed_input_files(track_ids: set[str]) -> None:
+    raw_root = resolve_project_path(config.raw_audio_dir)
+    for audio_path in scan_tracks(config):
+        track_id = stable_track_id(audio_path, raw_root)
+        if track_id not in track_ids:
+            continue
+        archive_successful_audio_source(audio_path, raw_root, track_id, config, state, add_log)
+
+
+def completed_input_track_matches() -> list[dict[str, str]]:
+    completed = load_completed_tracks().get("tracks", {})
+    if not completed:
+        return []
+    raw_root = resolve_project_path(config.raw_audio_dir)
+    matches = []
+    for audio_path in scan_tracks(config):
+        track_id = stable_track_id(audio_path, raw_root)
+        record = completed.get(track_id)
+        if not record:
+            continue
+        matches.append(
+            {
+                "track_id": track_id,
+                "filename": audio_path.name,
+                "completed_at": str(record.get("completed_at") or ""),
+                "clip_count": str(record.get("clip_count") or ""),
+            }
+        )
+    return matches
+
+
 def do_scan() -> None:
     try:
         tracks = scan_tracks(config)
@@ -1960,14 +2071,14 @@ def settings_dialog():
     return dialog
 
 
-async def do_analyze(progress_label) -> None:
+async def do_analyze(progress_label, force_reanalyze: bool = False) -> None:
     global analysis_process, analysis_started_at, processing, progress_text
     if processing:
         return
     processing = True
     analysis_started_at = datetime.now()
     progress_text = "准备分析..."
-    add_log("开始 Gemini 分析")
+    add_log("开始 Gemini 分析" + ("（重新分析已完成文件）" if force_reanalyze else ""))
     try:
         analysis_process = await asyncio.create_subprocess_exec(
             sys.executable,
@@ -1980,6 +2091,7 @@ async def do_analyze(progress_label) -> None:
                 "PYTHONUTF8": "1",
                 "PYTHONIOENCODING": "utf-8",
                 "PYTHONLEGACYWINDOWSSTDIO": "0",
+                "MUSIC_CLASSIFIER_FORCE_REANALYZE": "1" if force_reanalyze else "0",
             },
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
@@ -2027,6 +2139,40 @@ async def do_analyze(progress_label) -> None:
         progress_label.text = progress_text
 
 
+def prompt_or_start_analyze(progress_label) -> None:
+    matches = completed_input_track_matches()
+    if not matches:
+        asyncio.create_task(do_analyze(progress_label))
+        return
+    names = "\n".join(
+        f"- {item['filename']}（上次完成 {item['completed_at'] or '-'}，片段 {item['clip_count'] or '-'}）"
+        for item in matches[:12]
+    )
+    if len(matches) > 12:
+        names += f"\n... 还有 {len(matches) - 12} 个"
+
+    with ui.dialog() as dialog, ui.card().classes("w-[560px] max-w-full"):
+        ui.label("发现已完成文件").classes("text-lg font-bold")
+        ui.label("input 里有已经完成过的音频。可以跳过并清理 input，也可以重新分析。").classes("text-sm text-gray-600")
+        ui.textarea(value=names).props("readonly outlined dense").classes("w-full text-xs").style(
+            "font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; height: 140px;"
+        )
+
+        async def skip_completed() -> None:
+            dialog.close()
+            await do_analyze(progress_label, force_reanalyze=False)
+
+        async def reanalyze_completed() -> None:
+            dialog.close()
+            await do_analyze(progress_label, force_reanalyze=True)
+
+        with ui.row().classes("justify-end w-full"):
+            ui.button("取消", on_click=dialog.close).props("flat")
+            ui.button("跳过并清理 input", on_click=skip_completed).props("outline")
+            ui.button("重新分析", on_click=reanalyze_completed)
+    dialog.open()
+
+
 async def request_stop() -> None:
     global analysis_process
     if not processing:
@@ -2058,12 +2204,9 @@ def main() -> None:
             ui.timer(0.5, lambda: (progress_label.set_text(progress_text), update_run_widgets()))
             ui.timer(3.0, render_token_usage_panel.refresh)
             ui.timer(3.0, render_failure_panel.refresh)
-            async def start_analyze_click() -> None:
-                await do_analyze(progress_label)
-
             ui.button("扫描音频", on_click=do_scan).props("outline")
-            ui.button("开始 Gemini 分析", on_click=start_analyze_click)
-            ui.button("重试失败音频", on_click=start_analyze_click).props("outline color=warning")
+            ui.button("开始 Gemini 分析", on_click=lambda: prompt_or_start_analyze(progress_label))
+            ui.button("重试失败音频", on_click=lambda: prompt_or_start_analyze(progress_label)).props("outline color=warning")
             ui.button("中断分析", on_click=request_stop).props("outline color=negative")
             ui.button("保存当前结果", on_click=lambda: (save_results(state), ui.notify("结果已保存"))).props("outline")
             ui.button("导出 CSV", on_click=do_export_csv).props("outline")

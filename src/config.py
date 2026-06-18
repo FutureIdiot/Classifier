@@ -16,6 +16,7 @@ PROMPT_CONFIG_PATH = ROOT / "config" / "prompt_config.json"
 RESULTS_PATH = ROOT / "data" / "results.json"
 RAW_RESPONSES_PATH = ROOT / "data" / "raw_responses.jsonl"
 ERRORS_PATH = ROOT / "data" / "errors.jsonl"
+COMPLETED_TRACKS_PATH = ROOT / "data" / "completed_tracks.json"
 ENV_PATH = ROOT / ".env"
 PROMPT_CACHE_PATH = ROOT / "data" / "prompt_cache.json"
 
@@ -102,6 +103,29 @@ def save_results(state: ResultsState) -> None:
     RESULTS_PATH.parent.mkdir(parents=True, exist_ok=True)
     with RESULTS_PATH.open("w", encoding="utf-8") as handle:
         json.dump(state.model_dump(), handle, ensure_ascii=False, indent=2)
+
+
+def load_completed_tracks() -> dict:
+    if not COMPLETED_TRACKS_PATH.exists():
+        return {"tracks": {}}
+    try:
+        with COMPLETED_TRACKS_PATH.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return {"tracks": {}}
+    if not isinstance(payload, dict):
+        return {"tracks": {}}
+    tracks = payload.get("tracks")
+    if not isinstance(tracks, dict):
+        payload["tracks"] = {}
+    return payload
+
+
+def save_completed_tracks(payload: dict) -> None:
+    payload.setdefault("tracks", {})
+    COMPLETED_TRACKS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with COMPLETED_TRACKS_PATH.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
 
 
 def append_jsonl(path: Path, payload: dict) -> None:
