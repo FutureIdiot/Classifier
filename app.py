@@ -660,8 +660,8 @@ def api_add_category() -> JSONResponse:
 
 
 def add_styles() -> None:
-    ui.add_head_html('<link rel="stylesheet" href="/static/app.css">')
-    ui.add_body_html('<script src="/static/app.js"></script>')
+    ui.add_head_html('<link rel="stylesheet" href="/static/app.css?v=20260618b">')
+    ui.add_body_html('<script src="/static/app.js?v=20260618b"></script>')
 
 @ui.refreshable
 def render_board() -> None:
@@ -1276,10 +1276,10 @@ async def do_analyze(progress_label, force_reanalyze: bool = False) -> None:
         progress_label.text = progress_text
 
 
-def prompt_or_start_analyze(progress_label) -> None:
+async def prompt_or_start_analyze(progress_label) -> None:
     matches = completed_input_track_matches()
     if not matches:
-        asyncio.create_task(do_analyze(progress_label))
+        await do_analyze(progress_label)
         return
     names = "\n".join(
         f"- {item['filename']}（上次完成 {item['completed_at'] or '-'}，片段 {item['clip_count'] or '-'}）"
@@ -1341,9 +1341,12 @@ def main() -> None:
             ui.timer(0.5, lambda: (progress_label.set_text(progress_text), update_run_widgets()))
             ui.timer(3.0, render_token_usage_panel.refresh)
             ui.timer(3.0, render_failure_panel.refresh)
+            async def start_analyze_click() -> None:
+                await prompt_or_start_analyze(progress_label)
+
             ui.button("扫描音频", on_click=do_scan).props("outline")
-            ui.button("开始 Gemini 分析", on_click=lambda: prompt_or_start_analyze(progress_label))
-            ui.button("重试失败音频", on_click=lambda: prompt_or_start_analyze(progress_label)).props("outline color=warning")
+            ui.button("开始 Gemini 分析", on_click=start_analyze_click)
+            ui.button("重试失败音频", on_click=start_analyze_click).props("outline color=warning")
             ui.button("中断分析", on_click=request_stop).props("outline color=negative")
             ui.button("保存当前结果", on_click=lambda: (save_results(state), ui.notify("结果已保存"))).props("outline")
             ui.button("导出 CSV", on_click=do_export_csv).props("outline")
