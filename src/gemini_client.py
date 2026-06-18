@@ -47,6 +47,13 @@ def retryable_api_error(exc: Exception) -> bool:
     )
 
 
+def prompt_cache_too_small_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return all(marker in text for marker in ["cached", "content", "small"]) or all(
+        marker in text for marker in ["cache", "minimum"]
+    )
+
+
 def extract_json(text: str) -> dict[str, Any]:
     stripped = text.strip()
     if stripped.startswith("```"):
@@ -314,7 +321,8 @@ class GeminiClient:
             return name
         except Exception as exc:
             self._log(log, f"prompt cache 创建失败，改用普通 prompt：{type(exc).__name__}，{exc}")
-            if "Cached content is too small" in str(exc):
+            if prompt_cache_too_small_error(exc):
+                self._log(log, "prompt cache 内容低于 Gemini 最小长度，已记录；后续同配置会直接使用普通 prompt。")
                 self._save_prompt_cache_record(
                     {
                         "hash": cache_hash,
