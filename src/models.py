@@ -18,6 +18,7 @@ class AppConfig(BaseModel):
     clips_dir: str = "output/clips"
     processed_audio_dir: str = "workspaces/processed_input"
     final_output_dir: str = "output/final"
+    completed_output_dir: str = "completed_results"
     export_dir: str = "output/exports"
     downloads_dir: str = "~/Downloads"
     gemini_uploads_dir: str = "output/gemini_uploads"

@@ -35,7 +35,15 @@ from src.config import (
     save_results,
 )
 from src.edit_session_store import EditSessionStore
-from src.export_utils import build_zip, export_csv, open_folder, sync_classified_folders, visible_clips
+from src.export_utils import (
+    append_completed_folders,
+    build_zip,
+    clear_classified_workspace,
+    export_csv,
+    open_folder,
+    sync_classified_folders,
+    visible_clips,
+)
 from src.gemini_client import list_available_gemini_models
 from src.models import AppConfig, ResultsState
 from src.pipeline import (
@@ -1155,14 +1163,16 @@ def finalize_current_batch() -> bool:
         suffix = f" 等 {len(missing_outputs)} 个片段" if len(missing_outputs) > 6 else ""
         add_log(f"完成失败：仍有片段未写入结果文件夹，页面记录未清空：{preview}{suffix}")
         return False
+    completed_dir = append_completed_folders(config)
     record_completed_tracks(clips)
     archive_completed_input_files({clip.track_id for clip in clips})
+    clear_classified_workspace(config)
     state = ResultsState()
     save_results(state)
     edit_session = None
     save_edit_session(None)
     waveform_cache.clear()
-    add_log(f"已完成并清空页面记录：{len(clips)} 个片段。分类结果文件夹已保留。")
+    add_log(f"已完成并清空页面记录：{len(clips)} 个片段。累计结果已追加到：{completed_dir}")
     return True
 
 
@@ -1364,7 +1374,8 @@ def settings_dialog():
         raw_audio = ui.input("原始音频目录", value=config.raw_audio_dir).props("outlined dense").classes("w-full")
         clips_dir = ui.input("片段输出目录", value=config.clips_dir).props("outlined dense").classes("w-full")
         processed_audio_dir = ui.input("已处理原曲归档目录", value=config.processed_audio_dir).props("outlined dense").classes("w-full")
-        final_dir = ui.input("最终分类结果目录", value=config.final_output_dir).props("outlined dense").classes("w-full")
+        final_dir = ui.input("当前任务结果目录", value=config.final_output_dir).props("outlined dense").classes("w-full")
+        completed_dir = ui.input("累计结果目录", value=config.completed_output_dir).props("outlined dense").classes("w-full")
         export_dir = ui.input("导出目录", value=config.export_dir).props("outlined dense").classes("w-full")
         downloads_dir = ui.input("ZIP 下载目录", value=config.downloads_dir).props("outlined dense").classes("w-full")
         gemini_uploads_dir = ui.input("Gemini 上传代理目录", value=config.gemini_uploads_dir).props("outlined dense").classes("w-full")
@@ -1391,6 +1402,7 @@ def settings_dialog():
             config.clips_dir = clips_dir.value
             config.processed_audio_dir = processed_audio_dir.value
             config.final_output_dir = final_dir.value
+            config.completed_output_dir = completed_dir.value
             config.export_dir = export_dir.value
             config.downloads_dir = downloads_dir.value
             config.gemini_uploads_dir = gemini_uploads_dir.value

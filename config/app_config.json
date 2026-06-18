@@ -2,6 +2,7 @@
   "raw_audio_dir": "input",
   "clips_dir": "workspaces/slices",
   "final_output_dir": "workspaces/results",
+  "completed_output_dir": "completed_results",
   "export_dir": "workspaces/export",
   "downloads_dir": "~/Downloads/music_classifier_packages",
   "gemini_uploads_dir": "output/gemini_uploads",

@@ -168,10 +168,45 @@ def sync_classified_clip(
         "export_filename": filename,
         "clip_path": clip.clip_path,
     }
-    remove_unowned_same_filename_outputs(final_dir, filename, target_path, manifest)
     if save_manifest_file:
         save_manifest(final_dir, manifest)
     return target_path
+
+
+def append_completed_folders(config: AppConfig) -> Path:
+    workspace_dir = resolve_project_path(config.final_output_dir)
+    completed_dir = resolve_project_path(config.completed_output_dir)
+    completed_dir.mkdir(parents=True, exist_ok=True)
+    used_names: dict[Path, set[str]] = {}
+    if not workspace_dir.exists():
+        return completed_dir
+    for source in workspace_dir.rglob("*"):
+        if not source.is_file() or source.name == MANIFEST_NAME:
+            continue
+        try:
+            relative = source.relative_to(workspace_dir)
+        except ValueError:
+            relative = Path(source.name)
+        target_dir = completed_dir / relative.parent
+        target_dir.mkdir(parents=True, exist_ok=True)
+        filename = ensure_wav_suffix(source.name)
+        target_name = unique_filename(filename, used_names.setdefault(target_dir, existing_file_names(target_dir)))
+        shutil.copy2(source, target_dir / target_name)
+    return completed_dir
+
+
+def clear_classified_workspace(config: AppConfig) -> Path:
+    final_dir = resolve_project_path(config.final_output_dir)
+    final_dir.mkdir(parents=True, exist_ok=True)
+    for child in final_dir.iterdir():
+        try:
+            if child.is_dir():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+        except OSError:
+            pass
+    return final_dir
 
 
 def replaceable_output_paths(
@@ -223,34 +258,6 @@ def prune_inactive_manifest_outputs(final_dir: Path, manifest: dict[str, dict[st
         target = final_dir / str(manifest.get(clip_id, {}).get("target_path") or "")
         remove_stale_owned_output(target, final_dir / MANIFEST_NAME)
         manifest.pop(clip_id, None)
-
-
-def remove_unowned_same_filename_outputs(
-    final_dir: Path,
-    filename: str,
-    current_path: Path,
-    manifest: dict[str, dict[str, str]],
-) -> None:
-    owned_paths = {
-        (final_dir / str(entry.get("target_path") or "")).resolve()
-        for entry in manifest.values()
-        if entry.get("target_path")
-    }
-    try:
-        current_resolved = current_path.resolve()
-    except OSError:
-        current_resolved = current_path
-    for candidate in final_dir.glob(f"*/{filename}"):
-        try:
-            candidate_resolved = candidate.resolve()
-        except OSError:
-            candidate_resolved = candidate
-        if candidate_resolved == current_resolved or candidate_resolved in owned_paths:
-            continue
-        try:
-            candidate.unlink()
-        except OSError:
-            pass
 
 
 def build_zip(state: ResultsState, config: AppConfig) -> Path:
