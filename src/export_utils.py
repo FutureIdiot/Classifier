@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import filecmp
+import json
 import os
 import platform
 import shutil
@@ -12,6 +14,8 @@ import pandas as pd
 from src.config import resolve_project_path
 from src.models import AppConfig, ClipRecord, ResultsState
 
+
+MANIFEST_NAME = ".classified_manifest.json"
 
 CSV_COLUMNS = [
     "track_id",
@@ -46,21 +50,88 @@ def export_csv(state: ResultsState, config: AppConfig) -> Path:
 
 
 def build_classified_folders(state: ResultsState, config: AppConfig) -> Path:
+    return sync_classified_folders(state, config)
+
+
+def sync_classified_folders(state: ResultsState, config: AppConfig) -> Path:
     final_dir = resolve_project_path(config.final_output_dir)
     final_dir.mkdir(parents=True, exist_ok=True)
+    manifest = load_manifest(final_dir)
     used_names: dict[Path, set[str]] = {}
 
     for clip in visible_clips(state):
-        source = resolve_project_path(clip.clip_path)
-        if not source.exists():
-            continue
-        label = safe_folder_name(clip.final_label or "待复核")
-        target_dir = final_dir / label
-        target_dir.mkdir(parents=True, exist_ok=True)
-        filename = ensure_wav_suffix(clip.export_filename or clip.display_name)
-        target_name = unique_filename(filename, used_names.setdefault(target_dir, existing_file_names(target_dir)))
-        shutil.copy2(source, target_dir / target_name)
+        sync_classified_clip(clip, config, manifest=manifest, used_names=used_names, save_manifest_file=False)
+    save_manifest(final_dir, manifest)
     return final_dir
+
+
+def sync_track_classified_folders(state: ResultsState, config: AppConfig, track_id: str) -> Path:
+    final_dir = resolve_project_path(config.final_output_dir)
+    final_dir.mkdir(parents=True, exist_ok=True)
+    manifest = load_manifest(final_dir)
+    used_names: dict[Path, set[str]] = {}
+    for clip in visible_clips(state):
+        if clip.track_id == track_id:
+            sync_classified_clip(clip, config, manifest=manifest, used_names=used_names, save_manifest_file=False)
+    save_manifest(final_dir, manifest)
+    return final_dir
+
+
+def sync_classified_clip(
+    clip: ClipRecord,
+    config: AppConfig,
+    manifest: dict[str, dict[str, str]] | None = None,
+    used_names: dict[Path, set[str]] | None = None,
+    save_manifest_file: bool = True,
+) -> Path | None:
+    if clip.status in {"hidden", "replaced", "editing"}:
+        return None
+
+    source = resolve_project_path(clip.clip_path)
+    if not source.exists():
+        return None
+
+    final_dir = resolve_project_path(config.final_output_dir)
+    final_dir.mkdir(parents=True, exist_ok=True)
+    manifest = manifest if manifest is not None else load_manifest(final_dir)
+    used_names = used_names if used_names is not None else {}
+
+    label = safe_folder_name(clip.final_label or "待复核")
+    target_dir = final_dir / label
+    target_dir.mkdir(parents=True, exist_ok=True)
+    filename = ensure_wav_suffix(clip.export_filename or clip.display_name)
+
+    entry = manifest.get(clip.clip_id)
+    if entry:
+        manifest_path = final_dir / entry.get("target_path", "")
+        if (
+            entry.get("label") == label
+            and entry.get("export_filename") == filename
+            and manifest_path.exists()
+            and same_file_content(source, manifest_path)
+        ):
+            return manifest_path
+
+    desired_path = target_dir / filename
+    if desired_path.exists() and same_file_content(source, desired_path):
+        target_path = desired_path
+    else:
+        target_name = unique_filename(filename, used_names.setdefault(target_dir, existing_file_names(target_dir)))
+        target_path = target_dir / target_name
+        try:
+            shutil.copy2(source, target_path)
+        except OSError:
+            return None
+
+    manifest[clip.clip_id] = {
+        "target_path": target_path.relative_to(final_dir).as_posix(),
+        "label": label,
+        "export_filename": filename,
+        "clip_path": clip.clip_path,
+    }
+    if save_manifest_file:
+        save_manifest(final_dir, manifest)
+    return target_path
 
 
 def build_zip(state: ResultsState, config: AppConfig) -> Path:
@@ -70,7 +141,7 @@ def build_zip(state: ResultsState, config: AppConfig) -> Path:
     zip_path = downloads_dir / "classified_clips.zip"
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
         for file_path in final_dir.rglob("*"):
-            if file_path.is_file():
+            if file_path.is_file() and file_path.name != MANIFEST_NAME:
                 archive.write(file_path, file_path.relative_to(final_dir))
     return zip_path
 
@@ -104,7 +175,7 @@ def ensure_wav_suffix(filename: str) -> str:
 
 
 def existing_file_names(target_dir: Path) -> set[str]:
-    return {path.name.lower() for path in target_dir.iterdir() if path.is_file()}
+    return {path.name.lower() for path in target_dir.iterdir() if path.is_file() and path.name != MANIFEST_NAME}
 
 
 def unique_filename(filename: str, used_names: set[str]) -> str:
@@ -118,3 +189,30 @@ def unique_filename(filename: str, used_names: set[str]) -> str:
         candidate = f"{stem}_{index:02d}{suffix}"
     used_names.add(candidate.lower())
     return candidate
+
+
+def same_file_content(source: Path, target: Path) -> bool:
+    try:
+        if source.stat().st_size != target.stat().st_size:
+            return False
+        return filecmp.cmp(source, target, shallow=False)
+    except OSError:
+        return False
+
+
+def load_manifest(final_dir: Path) -> dict[str, dict[str, str]]:
+    path = final_dir / MANIFEST_NAME
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    return {str(key): value for key, value in payload.items() if isinstance(value, dict)}
+
+
+def save_manifest(final_dir: Path, manifest: dict[str, dict[str, str]]) -> None:
+    final_dir.mkdir(parents=True, exist_ok=True)
+    (final_dir / MANIFEST_NAME).write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")

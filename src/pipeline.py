@@ -16,6 +16,7 @@ from src.audio_utils import (
     stable_track_id,
 )
 from src.config import ERRORS_PATH, append_jsonl, resolve_project_path, save_app_config, save_results
+from src.export_utils import sync_classified_clip, sync_track_classified_folders
 from src.gemini_client import GeminiClient, GeminiRetryableError
 from src.models import AppConfig, CategoryConfig, ClipRecord, GeminiSegment, ResultsState
 from src.prompt_builder import build_prompt, build_static_prompt_context, build_track_prompt, prompt_cache_hash
@@ -66,6 +67,8 @@ def analyze_tracks(
             if track_id in known_track_ids:
                 emit(progress, f"跳过已分析歌曲：{audio_path.name}")
                 archive_successful_audio_source(audio_path, raw_root, track_id, config, state, progress)
+                sync_track_classified_folders(state, config, track_id)
+                save_results(state)
                 skipped_count += 1
                 continue
             emit(progress, f"读取音频时长：{audio_path.name}")
@@ -102,6 +105,7 @@ def analyze_tracks(
                         config=config,
                     )
                     state.clips.append(record)
+                    sync_classified_clip(record, config)
                     emit(progress, f"已生成片段：{record.clip_path}")
                 except Exception as exc:
                     emit(progress, f"片段失败：{audio_path.name} #{seg_index}，{exc}")
@@ -125,6 +129,7 @@ def analyze_tracks(
         finally:
             save_results(state)
         archive_successful_audio_source(audio_path, raw_root, track_id, config, state, progress)
+        sync_track_classified_folders(state, config, track_id)
         save_results(state)
         success_count += 1
     emit(progress, f"处理结束：共扫描 {len(tracks)} 首，成功 {success_count}，跳过 {skipped_count}，失败 {failed_count}")

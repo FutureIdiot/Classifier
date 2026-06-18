@@ -32,7 +32,7 @@ from src.config import (
     save_gemini_api_key,
     save_results,
 )
-from src.export_utils import build_classified_folders, build_zip, export_csv, open_folder, visible_clips
+from src.export_utils import build_classified_folders, build_zip, export_csv, open_folder, sync_classified_folders, visible_clips
 from src.gemini_client import list_available_gemini_models
 from src.models import AppConfig, ResultsState
 from src.pipeline import (
@@ -257,6 +257,7 @@ def file_bytes(path: Path, start: int, end: int, chunk_size: int = 1024 * 1024):
 async def move_clip(request: Request) -> JSONResponse:
     payload = await request.json()
     update_clip_label(state, payload["clip_id"], payload["label"])
+    sync_outputs("move_clip")
     return JSONResponse({"ok": True})
 
 
@@ -264,6 +265,7 @@ async def move_clip(request: Request) -> JSONResponse:
 async def rename_clip(request: Request) -> JSONResponse:
     payload = await request.json()
     update_clip_display_name(state, payload["clip_id"], payload["display_name"])
+    sync_outputs("rename_clip")
     return JSONResponse({"ok": True})
 
 
@@ -290,6 +292,7 @@ async def batch_update_clips(request: Request) -> JSONResponse:
             continue
         updated += 1
     save_results(state)
+    sync_outputs("batch_update_clips")
     return JSONResponse({"ok": True, "updated": updated})
 
 
@@ -368,6 +371,7 @@ async def commit_edit_regions(request: Request) -> JSONResponse:
         if clip.track_id == edit_session["track_id"] and clip.status == "editing" and clip.clip_id not in selected_clip_ids:
             clip.status = "replaced"
     save_results(state)
+    sync_outputs("commit_edit_regions")
     edit_session = None
     save_edit_session(None)
     return JSONResponse({"ok": True, "created": created})
@@ -391,6 +395,7 @@ async def api_update_category(request: Request) -> JSONResponse:
                     if clip.final_label == old_name:
                         clip.final_label = category.name
                 save_results(state)
+                sync_outputs("update_category")
             break
     prune_empty_categories(config, state)
     save_app_config(config)
@@ -1253,6 +1258,7 @@ def load_recut_values(clip_id: str, start_input, end_input, label_select) -> Non
 def do_recut(clip_id: str, start_sec: float, end_sec: float, final_label: str) -> None:
     try:
         recut_clip(config, state, clip_id, float(start_sec), float(end_sec), final_label)
+        sync_outputs("recut")
         reload_state()
         render_board.refresh()
         render_recut_area.refresh()
@@ -1390,6 +1396,15 @@ def update_run_widgets() -> None:
         run_status_label.set_text(run_status_text())
     if run_log_textarea is not None:
         run_log_textarea.value = "\n".join(run_logs) if run_logs else "暂无日志。"
+
+
+def sync_outputs(reason: str = "") -> Path | None:
+    try:
+        return sync_classified_folders(state, config)
+    except Exception as exc:
+        suffix = f"（{reason}）" if reason else ""
+        add_log(f"分类结果同步失败{suffix}：{exc}")
+        return None
 
 
 def do_scan() -> None:
@@ -1566,6 +1581,7 @@ def settings_dialog():
             config.prompt_cache_ttl_sec = int(prompt_cache_ttl.value or 86400)
             save_gemini_api_key(api_key.value or "")
             save_app_config(config)
+            sync_outputs("save_settings")
             dialog.close()
             ui.notify("配置已保存")
 
@@ -1663,6 +1679,7 @@ async def request_stop() -> None:
 
 def main() -> None:
     add_styles()
+    sync_outputs("startup")
     dialog = settings_dialog()
     clear_dialog = clear_data_dialog()
     with ui.header().classes("items-center justify-between bg-white text-gray-900 border-b"):
