@@ -482,6 +482,8 @@ async def batch_update_clips(request: Request) -> JSONResponse:
         finalized = finalize_current_batch()
     else:
         sync_outputs("batch_update_clips")
+    if finalized or updated:
+        refresh_main_views(reset_runtime=finalized)
     return JSONResponse({"ok": True, "updated": updated, "finalized": finalized})
 
 
@@ -1014,6 +1016,16 @@ def sync_outputs(reason: str = "") -> Path | None:
         return None
 
 
+def refresh_main_views(reset_runtime: bool = False) -> None:
+    render_board.refresh()
+    render_recut_area.refresh()
+    render_result_controls.refresh()
+    render_token_usage_panel.refresh()
+    render_failure_panel.refresh()
+    if reset_runtime:
+        ui.run_javascript("if (window.mcResetRuntimeState) window.mcResetRuntimeState();")
+
+
 def finalize_current_batch() -> bool:
     global edit_session, state
     clips = visible_clips(state)
@@ -1111,6 +1123,8 @@ def completed_input_track_matches() -> list[dict[str, str]]:
 
 def do_scan() -> None:
     try:
+        reload_state()
+        refresh_main_views(reset_runtime=True)
         tracks = scan_tracks(config)
         message = f"扫描完成：发现 {len(tracks)} 个音频文件"
         add_log(message)
@@ -1302,7 +1316,7 @@ async def do_analyze(progress_label=None, force_reanalyze: bool = False, retry_t
         return
     processing = True
     prepare_analysis_run()
-    ui.run_javascript("if (window.mcResetRuntimeState) window.mcResetRuntimeState();")
+    refresh_main_views(reset_runtime=True)
     analysis_started_at = datetime.now()
     progress_text = "准备分析..."
     if retry_track_ids:
