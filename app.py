@@ -181,8 +181,8 @@ def audio_response(path: Path, filename: str, range_header: str | None = None) -
         "Content-Disposition": f"inline; filename*=UTF-8''{quote(filename, safe='')}",
     }
 
-    byte_range = parse_range_header(range_header, size)
-    if range_header and byte_range is None:
+    byte_range, range_unsatisfiable = parse_range_header(range_header, size)
+    if range_unsatisfiable:
         return Response(status_code=416, headers={**headers, "Content-Range": f"bytes */{size}"})
 
     if byte_range is None:
@@ -216,28 +216,28 @@ def audio_media_type(path: Path) -> str:
     return mimetypes.guess_type(path.name)[0] or "application/octet-stream"
 
 
-def parse_range_header(range_header: str | None, size: int) -> tuple[int, int] | None:
+def parse_range_header(range_header: str | None, size: int) -> tuple[tuple[int, int] | None, bool]:
     if not range_header or not range_header.startswith("bytes=") or size <= 0:
-        return None
+        return None, False
     value = range_header.removeprefix("bytes=").strip()
     if "," in value or "-" not in value:
-        return None
+        return None, False
     start_text, end_text = value.split("-", 1)
     try:
         if start_text == "":
             suffix_length = int(end_text)
             if suffix_length <= 0:
-                return None
+                return None, False
             start = max(0, size - suffix_length)
             end = size - 1
         else:
             start = int(start_text)
             end = int(end_text) if end_text else size - 1
     except ValueError:
-        return None
+        return None, False
     if start < 0 or end < start or start >= size:
-        return None
-    return start, min(end, size - 1)
+        return None, True
+    return (start, min(end, size - 1)), False
 
 
 def file_bytes(path: Path, start: int, end: int, chunk_size: int = 1024 * 1024):
@@ -885,6 +885,7 @@ def add_styles() -> None:
             audio.dataset.manualPause = 'false';
             audio.dataset.clipId = clipId;
             audio.dataset.playToken = playToken;
+            audio.preload = 'auto';
             audio.onerror = () => {
               if (audio.dataset.playToken !== playToken) return;
               const error = audio.error;
@@ -902,9 +903,19 @@ def add_styles() -> None:
                 '\\n请直接打开 ' + url + ' 检查接口。'
               );
             };
-            if (audio.src !== new URL(url, window.location.href).href) {
-              audio.src = url;
+            const absoluteUrl = new URL(url, window.location.href).href;
+            const switchingSource = audio.src !== absoluteUrl;
+            if (switchingSource) {
+              audio.removeAttribute('src');
               audio.load();
+              audio.src = absoluteUrl;
+              audio.load();
+            } else {
+              try {
+                if (audio.ended || audio.currentTime > 0) audio.currentTime = 0;
+              } catch (error) {
+                audio.load();
+              }
             }
             audio.play()
               .then(() => {
@@ -920,6 +931,23 @@ def add_styles() -> None:
                 const message = error && error.message ? error.message : '';
                 if (error && error.name === 'AbortError') return;
                 if (message.includes('interrupted by a new load request')) return;
+                if (audio.dataset.retriedPlay !== playToken) {
+                  audio.dataset.retriedPlay = playToken;
+                  audio.removeAttribute('src');
+                  audio.load();
+                  audio.src = absoluteUrl;
+                  audio.load();
+                  audio.play().catch(() => {
+                    if (audio.dataset.playToken !== playToken) return;
+                    alert(
+                      '播放失败：' + message +
+                      '\\nnetworkState=' + audio.networkState +
+                      ' readyState=' + audio.readyState +
+                      '\\nURL=' + url
+                    );
+                  });
+                  return;
+                }
                 alert(
                   '播放失败：' + message +
                   '\\nnetworkState=' + audio.networkState +
