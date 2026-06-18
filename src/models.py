@@ -16,6 +16,7 @@ class CategoryConfig(BaseModel):
 class AppConfig(BaseModel):
     raw_audio_dir: str = "raw_audio"
     clips_dir: str = "output/clips"
+    processed_audio_dir: str = "workspaces/processed_input"
     final_output_dir: str = "output/final"
     export_dir: str = "output/exports"
     downloads_dir: str = "~/Downloads"

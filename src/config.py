@@ -55,6 +55,7 @@ def ensure_directories(config: AppConfig) -> None:
     for path_value in [
         config.raw_audio_dir,
         config.clips_dir,
+        config.processed_audio_dir,
         config.final_output_dir,
         config.export_dir,
         config.downloads_dir,

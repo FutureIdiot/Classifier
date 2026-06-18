@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import shutil
 import uuid
 from collections.abc import Callable
 from datetime import datetime
@@ -64,6 +65,7 @@ def analyze_tracks(
         try:
             if track_id in known_track_ids:
                 emit(progress, f"跳过已分析歌曲：{audio_path.name}")
+                archive_successful_audio_source(audio_path, raw_root, track_id, config, state, progress)
                 skipped_count += 1
                 continue
             emit(progress, f"读取音频时长：{audio_path.name}")
@@ -122,6 +124,8 @@ def analyze_tracks(
             continue
         finally:
             save_results(state)
+        archive_successful_audio_source(audio_path, raw_root, track_id, config, state, progress)
+        save_results(state)
         success_count += 1
     emit(progress, f"处理结束：共扫描 {len(tracks)} 首，成功 {success_count}，跳过 {skipped_count}，失败 {failed_count}")
     return state
@@ -191,6 +195,64 @@ def emit(progress: ProgressCallback | None, message: str) -> None:
         progress(message)
     else:
         print(message, flush=True)
+
+
+def archive_successful_audio_source(
+    audio_path: Path,
+    raw_root: Path,
+    track_id: str,
+    config: AppConfig,
+    state: ResultsState,
+    progress: ProgressCallback | None = None,
+) -> Path | None:
+    if not audio_path.exists():
+        return None
+    archive_root = resolve_project_path(config.processed_audio_dir)
+    try:
+        archive_root.resolve().relative_to(raw_root.resolve())
+        emit(progress, f"已处理音频归档目录位于原始目录内，保留原文件：{audio_path.name}")
+        return None
+    except ValueError:
+        pass
+    try:
+        relative_path = audio_path.resolve().relative_to(raw_root.resolve())
+    except ValueError:
+        relative_path = Path(audio_path.name)
+    target_path = unique_archive_path(archive_root / relative_path)
+    if audio_path.resolve() == target_path.resolve():
+        emit(progress, f"已处理音频归档目录不能与原始目录相同，保留原文件：{audio_path.name}")
+        return None
+    try:
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(audio_path), str(target_path))
+    except OSError as exc:
+        emit(progress, f"归档已处理音频失败：{audio_path.name}，下次扫描可能仍会看到它。{exc}")
+        log_error(
+            "archive_source_failed",
+            track_id=track_id,
+            source_audio_path=str(audio_path),
+            target_audio_path=str(target_path),
+            error=str(exc),
+        )
+        return None
+
+    archived_source_path = relative_or_absolute(target_path)
+    for clip in state.clips:
+        if clip.track_id == track_id:
+            clip.source_audio_path = archived_source_path
+    emit(progress, f"已从原始目录移走成功音频：{audio_path.name} -> {target_path}")
+    return target_path
+
+
+def unique_archive_path(path: Path) -> Path:
+    if not path.exists():
+        return path
+    index = 2
+    while True:
+        candidate = path.with_name(f"{path.stem}_{index:02d}{path.suffix}")
+        if not candidate.exists():
+            return candidate
+        index += 1
 
 
 def segment_to_clip_record(

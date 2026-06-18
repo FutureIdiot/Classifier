@@ -1528,6 +1528,7 @@ def settings_dialog():
         ui.label("配置").classes("text-lg font-bold")
         raw_audio = ui.input("原始音频目录", value=config.raw_audio_dir).props("outlined dense").classes("w-full")
         clips_dir = ui.input("片段输出目录", value=config.clips_dir).props("outlined dense").classes("w-full")
+        processed_audio_dir = ui.input("已处理原曲归档目录", value=config.processed_audio_dir).props("outlined dense").classes("w-full")
         final_dir = ui.input("最终分类结果目录", value=config.final_output_dir).props("outlined dense").classes("w-full")
         export_dir = ui.input("导出目录", value=config.export_dir).props("outlined dense").classes("w-full")
         downloads_dir = ui.input("ZIP 下载目录", value=config.downloads_dir).props("outlined dense").classes("w-full")
@@ -1553,6 +1554,7 @@ def settings_dialog():
         def save_settings() -> None:
             config.raw_audio_dir = raw_audio.value
             config.clips_dir = clips_dir.value
+            config.processed_audio_dir = processed_audio_dir.value
             config.final_output_dir = final_dir.value
             config.export_dir = export_dir.value
             config.downloads_dir = downloads_dir.value
