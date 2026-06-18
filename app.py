@@ -5,7 +5,6 @@ import html
 import json
 import mimetypes
 import os
-import shutil
 import sys
 from collections import deque
 from datetime import datetime
@@ -1486,12 +1485,11 @@ def render_result_controls() -> None:
 
 def clear_data_dialog():
     with ui.dialog() as dialog, ui.card().classes("w-[560px] max-w-full"):
-        ui.label("清除测试结果").classes("text-lg font-bold")
-        ui.label("默认只清空结果和日志，不会删除原始音频。勾选输出目录后，会删除已生成的切片、导出文件和 Gemini 上传代理。").classes("text-sm text-gray-600")
+        ui.label("清除分析结果").classes("text-lg font-bold")
+        ui.label("只清空当前页面记录和分析日志，不会删除 input、切片、分类结果、导出包或 Gemini 上传代理文件。").classes("text-sm text-gray-600")
         clear_results = ui.checkbox("清空 data/results.json", value=True)
         clear_logs = ui.checkbox("清空 data/raw_responses.jsonl 和 data/errors.jsonl", value=True)
         clear_prompt_cache = ui.checkbox("清除 prompt cache 记录", value=False)
-        clear_outputs = ui.checkbox("删除 clips/final/export/gemini_uploads 目录内容", value=False)
         confirm_text = ui.input("输入 CLEAR 确认").props("outlined dense").classes("w-full")
 
         def do_clear() -> None:
@@ -1509,20 +1507,9 @@ def clear_data_dialog():
                             path.unlink()
                 if clear_prompt_cache.value and PROMPT_CACHE_PATH.exists():
                     PROMPT_CACHE_PATH.unlink()
-                if clear_outputs.value:
-                    for path_value in [
-                        config.clips_dir,
-                        config.final_output_dir,
-                        config.export_dir,
-                        config.gemini_uploads_dir,
-                    ]:
-                        directory = resolve_project_path(path_value)
-                        if directory.exists():
-                            shutil.rmtree(directory)
-                        directory.mkdir(parents=True, exist_ok=True)
                 reload_state()
                 run_logs.clear()
-                add_log("已清除测试结果。")
+                add_log("已清除分析结果，输出文件夹未删除。")
                 render_board.refresh()
                 render_recut_area.refresh()
                 render_result_controls.refresh()
@@ -1697,7 +1684,7 @@ def main() -> None:
             ui.button("保存当前结果", on_click=lambda: (save_results(state), ui.notify("结果已保存"))).props("outline")
             ui.button("导出 CSV", on_click=do_export_csv).props("outline")
             ui.button("生成 ZIP", on_click=do_zip).props("outline")
-            ui.button("清除测试结果", on_click=clear_dialog.open).props("outline color=negative")
+            ui.button("清除分析结果", on_click=clear_dialog.open).props("outline color=negative")
             ui.button(icon="settings", on_click=dialog.open).props("flat round")
 
     with ui.column().classes("w-full p-4 gap-4"):
