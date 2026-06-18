@@ -784,6 +784,8 @@ def add_styles() -> None:
             background: rgba(37, 99, 235, 0.16);
             border-radius: 6px;
             cursor: move;
+            touch-action: none;
+            user-select: none;
           }
           .edit-region .region-handle {
             position: absolute;
@@ -792,6 +794,7 @@ def add_styles() -> None:
             height: 100%;
             background: rgba(37, 99, 235, 0.75);
             cursor: ew-resize;
+            touch-action: none;
           }
           .edit-region .region-handle.left { left: 0; border-radius: 5px 0 0 5px; }
           .edit-region .region-handle.right { right: 0; border-radius: 0 5px 5px 0; }
@@ -1135,13 +1138,10 @@ def add_styles() -> None:
             const duration = Number(root.dataset.duration || 1);
             layer.innerHTML = '';
             window.mcEditRegions.forEach((region, index) => {
-              const left = Math.max(0, Number(region.start_sec || 0) / duration * 100);
-              const right = Math.min(100, Number(region.end_sec || 0) / duration * 100);
               const el = document.createElement('div');
               el.className = 'edit-region';
               el.dataset.index = index;
-              el.style.left = left + '%';
-              el.style.width = Math.max(0.5, right - left) + '%';
+              mcApplyRegionElementPosition(el, region, duration);
               const color = mcRegionColor(region.label, 0.9);
               el.style.borderColor = color;
               el.style.background = mcRegionColor(region.label, 0.18);
@@ -1150,6 +1150,13 @@ def add_styles() -> None:
               mcAttachRegionDrag(el, region);
               layer.appendChild(el);
             });
+          }
+          function mcApplyRegionElementPosition(el, region, duration) {
+            const safeDuration = Math.max(1, Number(duration || 1));
+            const left = Math.max(0, Number(region.start_sec || 0) / safeDuration * 100);
+            const right = Math.min(100, Number(region.end_sec || 0) / safeDuration * 100);
+            el.style.left = left + '%';
+            el.style.width = Math.max(0.5, right - left) + '%';
           }
           function mcRegionColor(label, alpha) {
             const palette = ['37,99,235', '14,165,163', '124,58,237', '217,119,6', '5,150,105', '219,39,119'];
@@ -1192,13 +1199,14 @@ def add_styles() -> None:
               }
               region.start_sec = Math.round(region.start_sec * 10) / 10;
               region.end_sec = Math.round(region.end_sec * 10) / 10;
-              mcRenderRegions();
+              mcApplyRegionElementPosition(el, region, duration);
               mcRenderRegionTable();
             }
             function end(event) {
               el.releasePointerCapture(event.pointerId);
               el.removeEventListener('pointermove', move);
               el.removeEventListener('pointerup', end);
+              mcRenderRegions();
             }
           }
           function mcRenderRegionTable() {
@@ -1230,6 +1238,38 @@ def add_styles() -> None:
               `;
               table.appendChild(card);
             });
+          }
+          function mcAddEditRegion() {
+            const root = document.getElementById('mc-editor-root');
+            const audio = document.getElementById('mc-edit-audio');
+            if (!root || !window.mcEditRegions || window.mcEditRegions.length === 0) {
+              alert('当前没有可参考的原曲片段。');
+              return;
+            }
+            const duration = Math.max(1, Number(root.dataset.duration || 1));
+            const baseRegion = window.mcEditRegions[0];
+            const sorted = [...window.mcEditRegions].sort((a, b) => Number(a.end_sec || 0) - Number(b.end_sec || 0));
+            const lastEnd = Number(sorted.at(-1).end_sec || 0);
+            const current = audio && Number.isFinite(audio.currentTime) && audio.currentTime > 0 ? audio.currentTime : lastEnd;
+            const length = Math.min(12, Math.max(4, duration / 10));
+            const start = Math.max(0, Math.min(duration - length, current));
+            const end = Math.min(duration, start + length);
+            const label = (window.mcEditCategories && window.mcEditCategories[0] && window.mcEditCategories[0].name)
+              || baseRegion.label
+              || '';
+            const index = window.mcEditRegions.length + 1;
+            window.mcEditRegions.push({
+              clip_id: root.dataset.baseClipId || baseRegion.clip_id,
+              display_name: '新增片段_' + String(index).padStart(2, '0'),
+              label,
+              section: 'unknown',
+              start_sec: Math.round(start * 10) / 10,
+              end_sec: Math.round(end * 10) / 10,
+              selected: true,
+              is_new: true,
+            });
+            mcRenderRegions();
+            mcRenderRegionTable();
           }
           function mcCommitEditRegions() {
             if (!window.mcEditRegions || window.mcEditRegions.length === 0) {
@@ -1273,6 +1313,7 @@ def render_recut_area() -> None:
             ui.label("手动裁剪").classes("text-sm font-bold")
             if edit_session:
                 with ui.row().classes("gap-2"):
+                    ui.button("新增片段", on_click=lambda: ui.run_javascript("mcAddEditRegion()")).props("outline")
                     ui.button("取消编辑", on_click=cancel_edit_ui).props("outline")
                     ui.button("裁剪并确认", on_click=lambda: ui.run_javascript("mcCommitEditRegions()"))
         if not edit_session:
@@ -1291,12 +1332,14 @@ def render_recut_area() -> None:
         track_id = edit_session["track_id"]
         regions_json = json.dumps(edit_session["regions"], ensure_ascii=False)
         categories_json = json.dumps([category.model_dump() for category in config.categories if category.name.strip()], ensure_ascii=False)
+        base_clip_id = edit_session["regions"][0]["clip_id"] if edit_session["regions"] else ""
         source_url = f"/edit/source/{track_id}"
         ui.label(f"{edit_session['source_filename']} · {track_id}").classes("text-xs text-gray-500")
         ui.html(
             f"""
             <div id="mc-editor-root" class="wave-editor"
               data-track-id="{escape_attr(track_id)}"
+              data-base-clip-id="{escape_attr(base_clip_id)}"
               data-source-url="{escape_attr(source_url)}"
               data-regions="{escape_attr(regions_json)}"
               data-categories="{escape_attr(categories_json)}">
