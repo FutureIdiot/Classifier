@@ -31,7 +31,7 @@ from src.config import (
     save_gemini_api_key,
     save_results,
 )
-from src.export_utils import build_classified_folders, build_zip, export_csv, open_folder, sync_classified_folders, visible_clips
+from src.export_utils import build_zip, export_csv, open_folder, sync_classified_folders, visible_clips
 from src.gemini_client import list_available_gemini_models
 from src.models import AppConfig, ResultsState
 from src.pipeline import (
@@ -1420,6 +1420,64 @@ def token_value(value: int) -> str:
     return f"{value:,}" if value else "-"
 
 
+def load_failed_audio_records() -> list[dict[str, str]]:
+    if not ERRORS_PATH.exists():
+        return []
+    successful_tracks = {clip.track_id for clip in state.clips if clip.status not in {"hidden", "replaced", "editing"}}
+    latest_by_key: dict[tuple[str, str, str], dict[str, str]] = {}
+    with ERRORS_PATH.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            kind = str(record.get("kind") or "")
+            if kind not in {"track_failed", "segment_failed"}:
+                continue
+            track_id = str(record.get("track_id") or "")
+            if kind == "track_failed" and track_id in successful_tracks:
+                continue
+            source_path = str(record.get("source_audio_path") or "")
+            key = (kind, track_id, source_path)
+            latest_by_key[key] = {
+                "time": str(record.get("time") or ""),
+                "kind": "整首失败" if kind == "track_failed" else "片段失败",
+                "track_id": track_id or "-",
+                "source_audio_path": source_path,
+                "source_name": Path(source_path).name if source_path else "-",
+                "error": compact_error(str(record.get("error") or "")),
+                "retryable": "是" if kind == "track_failed" and source_path and resolve_project_path(source_path).exists() else "否",
+            }
+    return sorted(latest_by_key.values(), key=lambda item: item["time"], reverse=True)
+
+
+def compact_error(error: str, limit: int = 180) -> str:
+    cleaned = " ".join(error.split())
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[: limit - 1] + "..."
+
+
+@ui.refreshable
+def render_failure_panel() -> None:
+    failures = load_failed_audio_records()
+    if not failures:
+        return
+    with ui.card().classes("w-full p-2").style("border-radius:8px"):
+        with ui.row().classes("items-center justify-between w-full"):
+            ui.label(f"失败音频 {len(failures)}").classes("text-sm font-bold text-red-700")
+            ui.label("点击顶部“重试失败音频”会重新扫描 input，已成功歌曲会跳过。").classes("text-xs text-gray-500")
+        for item in failures[:12]:
+            with ui.column().classes("w-full gap-0 border-t border-gray-200 py-2"):
+                with ui.row().classes("items-center gap-2 w-full"):
+                    ui.label(item["source_name"]).classes("text-sm font-bold")
+                    ui.label(item["kind"]).classes("text-xs text-red-700")
+                    ui.label(f"track={item['track_id']}").classes("text-xs text-gray-500")
+                    ui.label(f"可重试={item['retryable']}").classes("text-xs text-gray-500")
+                    ui.label(item["time"]).classes("text-xs text-gray-500")
+                ui.label(item["error"] or "未知错误").classes("text-xs text-gray-700")
+
+
 @ui.refreshable
 def render_token_usage_panel() -> None:
     stats = load_token_usage_stats()
@@ -1581,6 +1639,7 @@ def clear_data_dialog():
                 render_recut_area.refresh()
                 render_result_controls.refresh()
                 render_token_usage_panel.refresh()
+                render_failure_panel.refresh()
                 dialog.close()
                 ui.notify("清除完成")
             except Exception as exc:
@@ -1684,6 +1743,7 @@ async def do_analyze(progress_label) -> None:
         render_board.refresh()
         render_recut_area.refresh()
         render_token_usage_panel.refresh()
+        render_failure_panel.refresh()
         if return_code in {-15, 1, 130} and "正在终止分析子进程" in "\n".join(run_logs):
             add_log("分析已中断，Gemini 请求已随子进程终止。")
             ui.notify("分析已中断")
@@ -1696,7 +1756,7 @@ async def do_analyze(progress_label) -> None:
                 ui.notify(f"分析失败，退出码 {return_code}", type="negative")
         else:
             if last_run_had_failures():
-                add_log("Gemini 分析完成，但有歌曲失败；可查看 data/errors.jsonl 后重跑。")
+                add_log("Gemini 分析完成，但有歌曲失败；请查看失败音频面板，可点击“重试失败音频”。")
                 ui.notify("分析完成，但有歌曲失败", type="warning")
             else:
                 add_log("Gemini 分析完成")
@@ -1742,11 +1802,13 @@ def main() -> None:
             progress_label = ui.label(progress_text).classes("text-xs text-gray-500")
             ui.timer(0.5, lambda: (progress_label.set_text(progress_text), update_run_widgets()))
             ui.timer(3.0, render_token_usage_panel.refresh)
+            ui.timer(3.0, render_failure_panel.refresh)
             async def start_analyze_click() -> None:
                 await do_analyze(progress_label)
 
             ui.button("扫描音频", on_click=do_scan).props("outline")
             ui.button("开始 Gemini 分析", on_click=start_analyze_click)
+            ui.button("重试失败音频", on_click=start_analyze_click).props("outline color=warning")
             ui.button("中断分析", on_click=request_stop).props("outline color=negative")
             ui.button("保存当前结果", on_click=lambda: (save_results(state), ui.notify("结果已保存"))).props("outline")
             ui.button("导出 CSV", on_click=do_export_csv).props("outline")
@@ -1756,12 +1818,12 @@ def main() -> None:
 
     with ui.column().classes("w-full p-4 gap-4"):
         render_run_panel()
+        render_failure_panel()
         render_token_usage_panel()
         render_recut_area()
         render_result_controls()
         render_board()
         with ui.row().classes("w-full justify-end"):
-            ui.button("生成分类文件夹", on_click=do_classified_folders).props("outline")
             ui.button("打开结果位置", on_click=do_open_final).props("outline")
 
 
@@ -1780,14 +1842,6 @@ def do_zip() -> None:
         ui.download(str(path))
     except Exception as exc:
         ui.notify(f"生成 ZIP 失败：{exc}", type="negative")
-
-
-def do_classified_folders() -> None:
-    try:
-        path = build_classified_folders(state, config)
-        ui.notify(f"分类文件夹已生成：{path}")
-    except Exception as exc:
-        ui.notify(f"生成失败：{exc}", type="negative")
 
 
 def do_open_final() -> None:
