@@ -140,6 +140,7 @@ def sync_classified_clip(
 
     if desired_path.exists() and same_file_content(source, desired_path):
         target_path = desired_path
+        remove_stale_owned_output(prior_manifest_path, target_path)
     elif desired_path.exists() and replaceable_targets is not None and desired_rel in replaceable_targets:
         try:
             shutil.copy2(source, desired_path)
@@ -155,6 +156,7 @@ def sync_classified_clip(
             shutil.copy2(source, target_path)
         except OSError:
             return None
+        remove_stale_owned_output(prior_manifest_path, target_path)
 
     manifest[clip.clip_id] = {
         "target_path": target_path.relative_to(final_dir).as_posix(),
