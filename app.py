@@ -163,6 +163,53 @@ def debug_visible_clips() -> JSONResponse:
     return JSONResponse({"count": len(records), "clips": records})
 
 
+@app.get("/api/debug_state")
+def debug_state() -> JSONResponse:
+    disk_state = load_results()
+    return JSONResponse(
+        {
+            "memory": debug_state_summary(state),
+            "disk": debug_state_summary(disk_state),
+            "edit_session_loaded": edit_session is not None,
+            "results_path": str(RESULTS_PATH),
+            "results_path_exists": RESULTS_PATH.exists(),
+            "results_path_size": RESULTS_PATH.stat().st_size if RESULTS_PATH.exists() else None,
+        }
+    )
+
+
+def debug_state_summary(results: ResultsState) -> dict[str, Any]:
+    status_counts: dict[str, int] = {}
+    clips = []
+    for clip in results.clips:
+        status_counts[clip.status] = status_counts.get(clip.status, 0) + 1
+        path = resolve_project_path(clip.clip_path)
+        source_path = resolve_project_path(clip.source_audio_path)
+        clips.append(
+            {
+                "clip_id": clip.clip_id,
+                "track_id": clip.track_id,
+                "status": clip.status,
+                "source_filename": clip.source_filename,
+                "clip_path": clip.clip_path,
+                "clip_exists": path.exists(),
+                "clip_size": path.stat().st_size if path.exists() else None,
+                "source_audio_path": clip.source_audio_path,
+                "source_exists": source_path.exists(),
+                "source_size": source_path.stat().st_size if source_path.exists() else None,
+                "final_label": clip.final_label,
+                "start_sec": clip.start_sec,
+                "end_sec": clip.end_sec,
+            }
+        )
+    return {
+        "clip_count": len(results.clips),
+        "visible_count": len(visible_clips(results)),
+        "status_counts": status_counts,
+        "clips": clips,
+    }
+
+
 @app.get("/waveform/{clip_id}")
 def waveform_preview(clip_id: str) -> Response:
     try:
