@@ -1593,6 +1593,12 @@ def main() -> None:
             ui.button("打开结果位置", on_click=do_open_final).props("outline")
 
 
+@ui.page("/")
+def index_page() -> None:
+    reload_state()
+    main()
+
+
 def do_export_csv() -> None:
     try:
         path = export_csv(state, config)
@@ -1617,5 +1623,4 @@ def do_open_final() -> None:
 
 
 if __name__ in {"__main__", "__mp_main__"}:
-    main()
     ui.run(title="本地音频分类工作台", reload=False)
