@@ -108,9 +108,12 @@ def save_edit_session(session: dict | None) -> None:
 
 @app.get("/media/{clip_id}")
 def media(clip_id: str, range_header: str | None = Header(default=None, alias="Range")) -> Response:
-    clip = find_clip(state, clip_id)
-    path = find_existing_clip_audio(clip)
-    return audio_response(path, clip.export_filename, range_header)
+    try:
+        clip = find_clip(state, clip_id)
+        path = find_existing_clip_audio(clip)
+        return audio_response(path, clip.export_filename, range_header)
+    except Exception as exc:
+        return missing_media_response(f"片段音频加载失败：{clip_id}，{exc}")
 
 
 @app.get("/api/debug_clip/{clip_id}")
@@ -134,11 +137,40 @@ def debug_clip(clip_id: str) -> JSONResponse:
     )
 
 
+@app.get("/api/debug_visible_clips")
+def debug_visible_clips() -> JSONResponse:
+    records = []
+    for clip in visible_clips(state):
+        path = resolve_project_path(clip.clip_path)
+        fallback_path = find_existing_clip_audio(clip)
+        source_info = find_existing_source_audio(clip.track_id, clip)
+        records.append(
+            {
+                "clip_id": clip.clip_id,
+                "track_id": clip.track_id,
+                "status": clip.status,
+                "source_filename": clip.source_filename,
+                "clip_path": clip.clip_path,
+                "clip_exists": path.exists(),
+                "clip_size": path.stat().st_size if path.exists() else None,
+                "fallback_path": str(fallback_path),
+                "fallback_exists": fallback_path.exists(),
+                "source_path": str(source_info[0]) if source_info else None,
+                "source_exists": source_info[0].exists() if source_info else False,
+                "source_ref": source_info[2] if source_info else clip.source_audio_path,
+            }
+        )
+    return JSONResponse({"count": len(records), "clips": records})
+
+
 @app.get("/waveform/{clip_id}")
 def waveform_preview(clip_id: str) -> Response:
-    clip = find_clip(state, clip_id)
-    path = find_existing_clip_audio(clip)
-    svg = cached_waveform_svg(path)
+    try:
+        clip = find_clip(state, clip_id)
+        path = find_existing_clip_audio(clip)
+        svg = cached_waveform_svg(path)
+    except Exception as exc:
+        svg = error_waveform_svg(f"波形加载失败：{clip_id}，{exc}")
     return Response(
         content=svg,
         media_type="image/svg+xml",
@@ -150,21 +182,27 @@ def waveform_preview(clip_id: str) -> Response:
 
 @app.get("/source/{clip_id}")
 def source_media(clip_id: str, range_header: str | None = Header(default=None, alias="Range")) -> Response:
-    clip = find_clip(state, clip_id)
-    source_info = find_existing_source_audio(clip.track_id, clip)
-    if source_info is None:
-        return audio_response(resolve_project_path(clip.source_audio_path), clip.source_filename, range_header)
-    source_path, source_filename, _ = source_info
-    return audio_response(source_path, source_filename, range_header)
+    try:
+        clip = find_clip(state, clip_id)
+        source_info = find_existing_source_audio(clip.track_id, clip)
+        if source_info is None:
+            return audio_response(resolve_project_path(clip.source_audio_path), clip.source_filename, range_header)
+        source_path, source_filename, _ = source_info
+        return audio_response(source_path, source_filename, range_header)
+    except Exception as exc:
+        return missing_media_response(f"原曲音频加载失败：{clip_id}，{exc}")
 
 
 @app.get("/edit/source/{track_id}")
 def edit_source_media(track_id: str, range_header: str | None = Header(default=None, alias="Range")) -> Response:
-    source_info = find_existing_source_audio(track_id)
-    if source_info is None:
-        raise KeyError(f"找不到原曲：{track_id}")
-    source_path, source_filename, _ = source_info
-    return audio_response(source_path, source_filename, range_header)
+    try:
+        source_info = find_existing_source_audio(track_id)
+        if source_info is None:
+            return missing_media_response(f"找不到原曲：{track_id}", status_code=404)
+        source_path, source_filename, _ = source_info
+        return audio_response(source_path, source_filename, range_header)
+    except Exception as exc:
+        return missing_media_response(f"编辑区原曲加载失败：{track_id}，{exc}")
 
 
 def find_existing_source_audio(track_id: str, preferred_clip: Any | None = None) -> tuple[Path, str, str] | None:
@@ -283,6 +321,15 @@ def audio_response(path: Path, filename: str, range_header: str | None = None) -
     return StreamingResponse(file_bytes(path, start, end), status_code=206, media_type=media_type, headers=headers)
 
 
+def missing_media_response(message: str, status_code: int = 404) -> Response:
+    return Response(
+        content=message,
+        status_code=status_code,
+        media_type="text/plain; charset=utf-8",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 def audio_media_type(path: Path) -> str:
     suffix = path.suffix.lower()
     if suffix == ".wav":
@@ -360,6 +407,26 @@ def build_waveform_svg(path: Path, width: int = 180, height: int = 18) -> str:
         f'<rect width="{width}" height="{height}" rx="3" fill="#f8fafc"/>'
         f'<g stroke="#64748b" stroke-width="1">{"".join(lines)}</g>'
         "</svg>"
+    )
+
+
+def error_waveform_svg(message: str, width: int = 180, height: int = 18) -> str:
+    return (
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}" '
+        'preserveAspectRatio="none">'
+        f'<rect width="{width}" height="{height}" rx="3" fill="#fff1f2"/>'
+        f'<path d="M0 {height // 2} H{width}" stroke="#f43f5e" stroke-width="1"/>'
+        f'<title>{html_escape(message)}</title>'
+        "</svg>"
+    )
+
+
+def html_escape(value: str) -> str:
+    return (
+        value.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
     )
 
 
@@ -703,7 +770,8 @@ def render_recut_area() -> None:
         regions_json = json.dumps(edit_session["regions"], ensure_ascii=False)
         categories_json = json.dumps([category.model_dump() for category in config.categories if category.name.strip()], ensure_ascii=False)
         base_clip_id = edit_session["regions"][0]["clip_id"] if edit_session["regions"] else ""
-        source_url = f"/edit/source/{track_id}?v={int(datetime.now().timestamp() * 1000)}"
+        encoded_track_id = quote(track_id, safe="")
+        source_url = f"/edit/source/{encoded_track_id}?v={int(datetime.now().timestamp() * 1000)}"
         ui.label(f"{edit_session['source_filename']} · {track_id}").classes("text-xs text-gray-500")
         ui.html(
             f"""
