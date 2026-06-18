@@ -58,9 +58,17 @@ def sync_classified_folders(state: ResultsState, config: AppConfig) -> Path:
     final_dir.mkdir(parents=True, exist_ok=True)
     manifest = load_manifest(final_dir)
     used_names: dict[Path, set[str]] = {}
+    replaceable_targets = replaceable_output_paths(state, final_dir, manifest)
 
     for clip in visible_clips(state):
-        sync_classified_clip(clip, config, manifest=manifest, used_names=used_names, save_manifest_file=False)
+        sync_classified_clip(
+            clip,
+            config,
+            manifest=manifest,
+            used_names=used_names,
+            replaceable_targets=replaceable_targets,
+            save_manifest_file=False,
+        )
     save_manifest(final_dir, manifest)
     return final_dir
 
@@ -70,9 +78,17 @@ def sync_track_classified_folders(state: ResultsState, config: AppConfig, track_
     final_dir.mkdir(parents=True, exist_ok=True)
     manifest = load_manifest(final_dir)
     used_names: dict[Path, set[str]] = {}
+    replaceable_targets = replaceable_output_paths(state, final_dir, manifest)
     for clip in visible_clips(state):
         if clip.track_id == track_id:
-            sync_classified_clip(clip, config, manifest=manifest, used_names=used_names, save_manifest_file=False)
+            sync_classified_clip(
+                clip,
+                config,
+                manifest=manifest,
+                used_names=used_names,
+                replaceable_targets=replaceable_targets,
+                save_manifest_file=False,
+            )
     save_manifest(final_dir, manifest)
     return final_dir
 
@@ -82,6 +98,7 @@ def sync_classified_clip(
     config: AppConfig,
     manifest: dict[str, dict[str, str]] | None = None,
     used_names: dict[Path, set[str]] | None = None,
+    replaceable_targets: set[str] | None = None,
     save_manifest_file: bool = True,
 ) -> Path | None:
     if clip.status in {"hidden", "replaced", "editing"}:
@@ -100,20 +117,36 @@ def sync_classified_clip(
     target_dir = final_dir / label
     target_dir.mkdir(parents=True, exist_ok=True)
     filename = ensure_wav_suffix(clip.export_filename or clip.display_name)
+    desired_path = target_dir / filename
+    desired_rel = desired_path.relative_to(final_dir).as_posix()
+    prior_manifest_path: Path | None = None
 
     entry = manifest.get(clip.clip_id)
     if entry:
         manifest_path = final_dir / entry.get("target_path", "")
+        prior_manifest_path = manifest_path
         if (
             entry.get("label") == label
             and entry.get("export_filename") == filename
             and manifest_path.exists()
             and same_file_content(source, manifest_path)
+            and (
+                manifest_path == desired_path
+                or desired_rel not in (replaceable_targets or set())
+                or not desired_path.exists()
+            )
         ):
             return manifest_path
 
-    desired_path = target_dir / filename
     if desired_path.exists() and same_file_content(source, desired_path):
+        target_path = desired_path
+    elif desired_path.exists() and replaceable_targets is not None and desired_rel in replaceable_targets:
+        try:
+            shutil.copy2(source, desired_path)
+        except OSError:
+            return None
+        remove_manifest_entries_for_target(manifest, desired_rel, keep_clip_id=clip.clip_id)
+        remove_stale_owned_output(prior_manifest_path, desired_path)
         target_path = desired_path
     else:
         target_name = unique_filename(filename, used_names.setdefault(target_dir, existing_file_names(target_dir)))
@@ -132,6 +165,48 @@ def sync_classified_clip(
     if save_manifest_file:
         save_manifest(final_dir, manifest)
     return target_path
+
+
+def replaceable_output_paths(
+    state: ResultsState,
+    final_dir: Path,
+    manifest: dict[str, dict[str, str]],
+) -> set[str]:
+    status_by_id = {clip.clip_id: clip.status for clip in state.clips}
+    replaceable: set[str] = {
+        str(entry.get("target_path") or "")
+        for clip_id, entry in manifest.items()
+        if status_by_id.get(clip_id) == "replaced" and entry.get("target_path")
+    }
+    for clip in state.clips:
+        if clip.status != "replaced":
+            continue
+        label = safe_folder_name(clip.final_label or "待复核")
+        filename = ensure_wav_suffix(clip.export_filename or clip.display_name)
+        replaceable.add((final_dir / label / filename).relative_to(final_dir).as_posix())
+    return replaceable
+
+
+def remove_manifest_entries_for_target(
+    manifest: dict[str, dict[str, str]],
+    target_path: str,
+    keep_clip_id: str,
+) -> None:
+    for clip_id in [
+        clip_id
+        for clip_id, entry in manifest.items()
+        if clip_id != keep_clip_id and entry.get("target_path") == target_path
+    ]:
+        manifest.pop(clip_id, None)
+
+
+def remove_stale_owned_output(old_path: Path | None, new_path: Path) -> None:
+    if old_path is None or old_path == new_path or not old_path.exists():
+        return
+    try:
+        old_path.unlink()
+    except OSError:
+        pass
 
 
 def build_zip(state: ResultsState, config: AppConfig) -> Path:
