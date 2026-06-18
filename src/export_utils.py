@@ -5,7 +5,6 @@ import platform
 import shutil
 import subprocess
 import zipfile
-from collections import defaultdict
 from pathlib import Path
 
 import pandas as pd
@@ -49,7 +48,7 @@ def export_csv(state: ResultsState, config: AppConfig) -> Path:
 def build_classified_folders(state: ResultsState, config: AppConfig) -> Path:
     final_dir = resolve_project_path(config.final_output_dir)
     final_dir.mkdir(parents=True, exist_ok=True)
-    used_names: dict[str, defaultdict[str, int]] = defaultdict(lambda: defaultdict(int))
+    used_names: dict[Path, set[str]] = {}
 
     for clip in visible_clips(state):
         source = resolve_project_path(clip.clip_path)
@@ -59,7 +58,7 @@ def build_classified_folders(state: ResultsState, config: AppConfig) -> Path:
         target_dir = final_dir / label
         target_dir.mkdir(parents=True, exist_ok=True)
         filename = ensure_wav_suffix(clip.export_filename or clip.display_name)
-        target_name = unique_filename(filename, used_names[label])
+        target_name = unique_filename(filename, used_names.setdefault(target_dir, existing_file_names(target_dir)))
         shutil.copy2(source, target_dir / target_name)
     return final_dir
 
@@ -104,12 +103,18 @@ def ensure_wav_suffix(filename: str) -> str:
     return f"{path.stem}.wav"
 
 
-def unique_filename(filename: str, counter: defaultdict[str, int]) -> str:
+def existing_file_names(target_dir: Path) -> set[str]:
+    return {path.name.lower() for path in target_dir.iterdir() if path.is_file()}
+
+
+def unique_filename(filename: str, used_names: set[str]) -> str:
     path = Path(filename)
     stem = path.stem
     suffix = path.suffix or ".wav"
-    counter[filename] += 1
-    count = counter[filename]
-    if count == 1:
-        return f"{stem}{suffix}"
-    return f"{stem}_{count:02d}{suffix}"
+    index = 1
+    candidate = f"{stem}{suffix}"
+    while candidate.lower() in used_names:
+        index += 1
+        candidate = f"{stem}_{index:02d}{suffix}"
+    used_names.add(candidate.lower())
+    return candidate

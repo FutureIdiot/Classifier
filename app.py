@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import html
 import json
+import mimetypes
 import os
 import shutil
 import sys
@@ -10,9 +11,10 @@ from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from fastapi import Header, Request
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from nicegui import app, ui
 
 from src.audio_utils import seconds_to_mmss
@@ -172,15 +174,83 @@ def audio_response(path: Path, filename: str, range_header: str | None = None) -
     path = path.expanduser()
     if not path.exists():
         return Response(content=f"Audio file not found: {path}", status_code=404, media_type="text/plain; charset=utf-8")
-    return FileResponse(
-        path,
-        media_type="audio/wav",
-        filename=filename,
-        headers={
-            "Accept-Ranges": "bytes",
-            "Cache-Control": "no-store",
-        },
+    size = path.stat().st_size
+    media_type = audio_media_type(path)
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Cache-Control": "no-store",
+        "Content-Disposition": f"inline; filename*=UTF-8''{quote(filename, safe='')}",
+    }
+
+    byte_range = parse_range_header(range_header, size)
+    if range_header and byte_range is None:
+        return Response(status_code=416, headers={**headers, "Content-Range": f"bytes */{size}"})
+
+    if byte_range is None:
+        headers["Content-Length"] = str(size)
+        return StreamingResponse(file_bytes(path, 0, size - 1), media_type=media_type, headers=headers)
+
+    start, end = byte_range
+    headers.update(
+        {
+            "Content-Length": str(end - start + 1),
+            "Content-Range": f"bytes {start}-{end}/{size}",
+        }
     )
+    return StreamingResponse(file_bytes(path, start, end), status_code=206, media_type=media_type, headers=headers)
+
+
+def audio_media_type(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix == ".wav":
+        return "audio/wav"
+    if suffix == ".mp3":
+        return "audio/mpeg"
+    if suffix == ".m4a":
+        return "audio/mp4"
+    if suffix == ".aac":
+        return "audio/aac"
+    if suffix == ".flac":
+        return "audio/flac"
+    if suffix == ".ogg":
+        return "audio/ogg"
+    return mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+
+
+def parse_range_header(range_header: str | None, size: int) -> tuple[int, int] | None:
+    if not range_header or not range_header.startswith("bytes=") or size <= 0:
+        return None
+    value = range_header.removeprefix("bytes=").strip()
+    if "," in value or "-" not in value:
+        return None
+    start_text, end_text = value.split("-", 1)
+    try:
+        if start_text == "":
+            suffix_length = int(end_text)
+            if suffix_length <= 0:
+                return None
+            start = max(0, size - suffix_length)
+            end = size - 1
+        else:
+            start = int(start_text)
+            end = int(end_text) if end_text else size - 1
+    except ValueError:
+        return None
+    if start < 0 or end < start or start >= size:
+        return None
+    return start, min(end, size - 1)
+
+
+def file_bytes(path: Path, start: int, end: int, chunk_size: int = 1024 * 1024):
+    with path.open("rb") as handle:
+        handle.seek(start)
+        remaining = end - start + 1
+        while remaining > 0:
+            chunk = handle.read(min(chunk_size, remaining))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+            yield chunk
 
 
 @app.post("/api/move_clip")
