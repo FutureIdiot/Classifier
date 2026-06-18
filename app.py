@@ -6,6 +6,7 @@ import json
 import mimetypes
 import os
 import sys
+import wave
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -58,6 +59,7 @@ analysis_started_at: datetime | None = None
 last_log_at: datetime | None = None
 run_status_label = None
 run_log_textarea = None
+waveform_cache: dict[str, tuple[int, int, str]] = {}
 EDIT_SESSION_PATH = ROOT / "data" / "edit_session.json"
 edit_session: dict | None = None
 result_filters = {
@@ -162,6 +164,20 @@ def debug_clip(clip_id: str) -> JSONResponse:
             "source_path": str(source_info[0]) if source_info else None,
             "source_exists": source_info[0].exists() if source_info else False,
         }
+    )
+
+
+@app.get("/waveform/{clip_id}")
+def waveform_preview(clip_id: str) -> Response:
+    clip = find_clip(state, clip_id)
+    path = find_existing_clip_audio(clip)
+    svg = cached_waveform_svg(path)
+    return Response(
+        content=svg,
+        media_type="image/svg+xml",
+        headers={
+            "Cache-Control": "no-store",
+        },
     )
 
 
@@ -348,6 +364,104 @@ def file_bytes(path: Path, start: int, end: int, chunk_size: int = 1024 * 1024):
                 break
             remaining -= len(chunk)
             yield chunk
+
+
+def build_waveform_svg(path: Path, width: int = 180, height: int = 18) -> str:
+    peaks = waveform_peaks(path, width)
+    if not peaks:
+        mid = height // 2
+        return (
+            f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">'
+            f'<rect width="{width}" height="{height}" fill="none"/>'
+            f'<path d="M0 {mid} H{width}" stroke="#cbd5e1" stroke-width="1"/>'
+            "</svg>"
+        )
+    mid = height / 2
+    scale = max(1.0, mid - 2)
+    lines = []
+    for index, peak in enumerate(peaks):
+        amp = max(0.04, min(1.0, peak))
+        y1 = round(mid - amp * scale, 2)
+        y2 = round(mid + amp * scale, 2)
+        lines.append(f'<line x1="{index}" y1="{y1}" x2="{index}" y2="{y2}"/>')
+    return (
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}" '
+        'preserveAspectRatio="none">'
+        f'<rect width="{width}" height="{height}" rx="3" fill="#f8fafc"/>'
+        f'<g stroke="#64748b" stroke-width="1">{"".join(lines)}</g>'
+        "</svg>"
+    )
+
+
+def waveform_peaks(path: Path, width: int) -> list[float]:
+    try:
+        with wave.open(str(path), "rb") as handle:
+            channels = handle.getnchannels()
+            sample_width = handle.getsampwidth()
+            frame_count = handle.getnframes()
+            if frame_count <= 0 or sample_width not in {1, 2, 3, 4}:
+                return []
+            frames_per_bucket = max(1, frame_count // width)
+            peaks: list[float] = []
+            max_possible = float(1 << (8 * sample_width - 1))
+            for _ in range(width):
+                data = handle.readframes(frames_per_bucket)
+                if not data:
+                    break
+                peak = pcm_peak(data, sample_width, channels) / max_possible
+                peaks.append(min(1.0, peak))
+            if not peaks:
+                return []
+            while len(peaks) < width:
+                peaks.append(0.0)
+            return normalize_peaks(peaks)
+    except Exception:
+        return []
+
+
+def normalize_peaks(peaks: list[float]) -> list[float]:
+    maximum = max(peaks) if peaks else 0.0
+    if maximum <= 0:
+        return peaks
+    return [min(1.0, peak / maximum) for peak in peaks]
+
+
+def cached_waveform_svg(path: Path) -> str:
+    try:
+        stat = path.stat()
+    except OSError:
+        return build_waveform_svg(path)
+    key = str(path.resolve())
+    cached = waveform_cache.get(key)
+    signature = (stat.st_mtime_ns, stat.st_size)
+    if cached and cached[0] == signature[0] and cached[1] == signature[1]:
+        return cached[2]
+    svg = build_waveform_svg(path)
+    waveform_cache[key] = (signature[0], signature[1], svg)
+    return svg
+
+
+def pcm_peak(data: bytes, sample_width: int, channels: int) -> int:
+    frame_width = sample_width * max(1, channels)
+    if frame_width <= 0:
+        return 0
+    peak = 0
+    for frame_start in range(0, len(data) - frame_width + 1, frame_width):
+        for channel in range(max(1, channels)):
+            offset = frame_start + channel * sample_width
+            sample = pcm_sample_value(data[offset : offset + sample_width], sample_width)
+            peak = max(peak, abs(sample))
+    return peak
+
+
+def pcm_sample_value(sample: bytes, sample_width: int) -> int:
+    if sample_width == 1:
+        return sample[0] - 128
+    if sample_width == 3:
+        sign_byte = b"\xff" if sample[2] & 0x80 else b"\x00"
+        sample = sample + sign_byte
+        return int.from_bytes(sample, byteorder="little", signed=True)
+    return int.from_bytes(sample, byteorder="little", signed=True)
 
 
 @app.post("/api/move_clip")
@@ -631,14 +745,18 @@ def card_html(clip) -> str:
     duration = seconds_to_mmss(clip.duration_sec)
     original = js_str(clip.display_name)
     confidence_text = f"{clip.confidence:.2f}"
+    waveform_url = f"/waveform/{quote(clip.clip_id, safe='')}"
     return f"""
     <div class="clip-row" data-clip-id="{escape_attr(clip.clip_id)}" draggable="true" ondragstart="mcDragClip(event, {js_str(clip.clip_id)})">
       <input class="clip-check" type="checkbox" data-clip-id="{escape_attr(clip.clip_id)}" onclick="event.stopPropagation()">
       <button class="play-btn" onclick="mcPlay({js_str(clip.clip_id)})">▶</button>
       <button class="edit-btn" onclick="mcStartEditClip({js_str(clip.clip_id)})" title="送到上方编辑区">✎</button>
-      <input class="clip-name" value="{escape_attr(clip.display_name)}"
-        onkeydown="mcInputKey(event, {original})"
-        onblur="mcRenameClip({js_str(clip.clip_id)}, this.value)">
+      <div class="clip-name-wrap">
+        <img class="clip-waveform" src="{escape_attr(waveform_url)}" alt="">
+        <input class="clip-name" value="{escape_attr(clip.display_name)}"
+          onkeydown="mcInputKey(event, {original})"
+          onblur="mcRenameClip({js_str(clip.clip_id)}, this.value)">
+      </div>
       <span class="clip-duration">{duration}</span>
       <span class="confidence" style="{confidence_style(clip.confidence)}" title="Gemini confidence">{confidence_text}</span>
     </div>
@@ -778,11 +896,33 @@ def add_styles() -> None:
             height: 28px;
             padding: 0;
             font-size: 13px;
+            position: relative;
+            z-index: 1;
           }
           .clip-name:focus {
             background: #fff;
             border: 1px solid #b8c4d0;
             padding: 0 6px;
+          }
+          .clip-name-wrap {
+            position: relative;
+            min-width: 0;
+            height: 28px;
+            display: grid;
+            align-items: center;
+          }
+          .clip-waveform {
+            position: absolute;
+            inset: 5px 0 5px 0;
+            width: 100%;
+            height: 18px;
+            object-fit: fill;
+            opacity: 0.42;
+            pointer-events: none;
+            border-radius: 3px;
+          }
+          .clip-row.is-playing .clip-waveform {
+            opacity: 0.68;
           }
           .clip-duration, .confidence {
             font-size: 12px;
