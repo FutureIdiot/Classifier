@@ -7,12 +7,12 @@ from src.audio_utils import seconds_to_mmss
 from src.models import AppConfig, ClipRecord
 
 
-def board_html(config: AppConfig, grouped: dict[str, list[ClipRecord]]) -> str:
+def board_html(config: AppConfig, grouped: dict[str, list[ClipRecord]], media_version: str = "") -> str:
     columns = []
     for category in config.categories:
         title = "" if not category.name.strip() and not category.description.strip() else category.name
         clips = grouped.get(category.name, []) if category.name else []
-        card_rows = "\n".join(card_html(clip) for clip in clips)
+        card_rows = "\n".join(card_html(clip, media_version) for clip in clips)
         columns.append(
             f"""
             <section class="kanban-column" data-label="{escape_attr(category.name)}"
@@ -34,7 +34,7 @@ def board_html(config: AppConfig, grouped: dict[str, list[ClipRecord]]) -> str:
     for label, clips in grouped.items():
         if label in known_labels:
             continue
-        card_rows = "\n".join(card_html(clip) for clip in clips)
+        card_rows = "\n".join(card_html(clip, media_version) for clip in clips)
         columns.append(
             f"""
             <section class="kanban-column" data-label="{escape_attr(label)}"
@@ -67,13 +67,16 @@ def board_html(config: AppConfig, grouped: dict[str, list[ClipRecord]]) -> str:
     """
 
 
-def card_html(clip: ClipRecord) -> str:
+def card_html(clip: ClipRecord, media_version: str = "") -> str:
     duration = seconds_to_mmss(clip.duration_sec)
     original = js_str(clip.display_name)
     confidence_text = f"{clip.confidence:.2f}"
-    waveform_url = f"/waveform/{quote(clip.clip_id, safe='')}"
+    query = f"?v={quote(media_version, safe='')}" if media_version else ""
+    encoded_clip_id = quote(clip.clip_id, safe="")
+    waveform_url = f"/waveform/{encoded_clip_id}{query}"
+    media_url = f"/media/{encoded_clip_id}{query}"
     return f"""
-    <div class="clip-row" data-clip-id="{escape_attr(clip.clip_id)}" draggable="true" ondragstart="mcDragClip(event, {js_str(clip.clip_id)})">
+    <div class="clip-row" data-clip-id="{escape_attr(clip.clip_id)}" data-media-url="{escape_attr(media_url)}" draggable="true" ondragstart="mcDragClip(event, {js_str(clip.clip_id)})">
       <input class="clip-check" type="checkbox" data-clip-id="{escape_attr(clip.clip_id)}" onclick="event.stopPropagation()">
       <button class="play-btn" onclick="mcPlay({js_str(clip.clip_id)})">▶</button>
       <button class="edit-btn" onclick="mcStartEditClip({js_str(clip.clip_id)})" title="送到上方编辑区">✎</button>

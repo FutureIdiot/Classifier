@@ -27,7 +27,9 @@ function mcUpdateCategory(categoryId, name, description) {
   }).then(() => setTimeout(() => window.location.reload(), 120));
 }
 function mcPlay(clipId) {
-  const url = '/media/' + encodeURIComponent(clipId);
+  const escapedClipId = window.CSS && CSS.escape ? CSS.escape(clipId) : clipId.replace(/"/g, '\\"');
+  const row = document.querySelector(`.clip-row[data-clip-id="${escapedClipId}"]`);
+  const url = row && row.dataset.mediaUrl ? row.dataset.mediaUrl : '/media/' + encodeURIComponent(clipId);
   let audio = document.getElementById('mc-global-audio');
   if (!audio) {
     audio = document.createElement('audio');
@@ -39,8 +41,6 @@ function mcPlay(clipId) {
     });
     document.body.appendChild(audio);
   }
-  const escapedClipId = window.CSS && CSS.escape ? CSS.escape(clipId) : clipId.replace(/"/g, '\\"');
-  const row = document.querySelector(`.clip-row[data-clip-id="${escapedClipId}"]`);
   if (audio.dataset.clipId === clipId && !audio.paused) {
     audio.dataset.manualPause = 'true';
     audio.pause();

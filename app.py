@@ -660,12 +660,13 @@ def api_add_category() -> JSONResponse:
 
 
 def add_styles() -> None:
-    ui.add_head_html('<link rel="stylesheet" href="/static/app.css?v=20260618b">')
-    ui.add_body_html('<script src="/static/app.js?v=20260618b"></script>')
+    ui.add_head_html('<link rel="stylesheet" href="/static/app.css?v=20260618c">')
+    ui.add_body_html('<script src="/static/app.js?v=20260618c"></script>')
 
 @ui.refreshable
 def render_board() -> None:
-    ui.html(board_html(config, visible_by_label()), sanitize=False).classes("w-full")
+    media_version = str(int(datetime.now().timestamp() * 1000))
+    ui.html(board_html(config, visible_by_label(), media_version=media_version), sanitize=False).classes("w-full")
 
 
 @ui.refreshable
@@ -698,7 +699,7 @@ def render_recut_area() -> None:
         regions_json = json.dumps(edit_session["regions"], ensure_ascii=False)
         categories_json = json.dumps([category.model_dump() for category in config.categories if category.name.strip()], ensure_ascii=False)
         base_clip_id = edit_session["regions"][0]["clip_id"] if edit_session["regions"] else ""
-        source_url = f"/edit/source/{track_id}"
+        source_url = f"/edit/source/{track_id}?v={int(datetime.now().timestamp() * 1000)}"
         ui.label(f"{edit_session['source_filename']} · {track_id}").classes("text-xs text-gray-500")
         ui.html(
             f"""
@@ -1265,9 +1266,11 @@ async def do_analyze(progress_label, force_reanalyze: bool = False) -> None:
             else:
                 add_log("Gemini 分析完成")
                 ui.notify("Gemini 分析完成")
+        ui.run_javascript("setTimeout(() => window.location.reload(), 500)")
     except Exception as exc:
         add_log(f"分析失败：{exc}")
         ui.notify(f"分析失败：{exc}", type="negative")
+        ui.run_javascript("setTimeout(() => window.location.reload(), 800)")
     finally:
         analysis_process = None
         analysis_started_at = None
