@@ -111,7 +111,7 @@ def rebuild_edit_session_from_state() -> dict | None:
         return None
     track_id = editing_clips[0].track_id
     track_clips = [clip for clip in editing_clips if clip.track_id == track_id]
-    source_info = find_existing_source_audio(track_id, track_clips[0])
+    source_info = find_existing_source_audio(track_id, track_clips[0]) if "find_existing_source_audio" in globals() else None
     source_filename = source_info[1] if source_info else track_clips[0].source_filename
     source_audio_path = source_info[2] if source_info else track_clips[0].source_audio_path
     regions = [
@@ -140,13 +140,16 @@ edit_session = load_edit_session()
 @app.get("/media/{clip_id}")
 def media(clip_id: str, range_header: str | None = Header(default=None, alias="Range")) -> Response:
     clip = find_clip(state, clip_id)
-    return audio_response(resolve_project_path(clip.clip_path), clip.export_filename, range_header)
+    path = find_existing_clip_audio(clip)
+    return audio_response(path, clip.export_filename, range_header)
 
 
 @app.get("/api/debug_clip/{clip_id}")
 def debug_clip(clip_id: str) -> JSONResponse:
     clip = find_clip(state, clip_id)
     path = resolve_project_path(clip.clip_path)
+    fallback_path = find_existing_clip_audio(clip)
+    source_info = find_existing_source_audio(clip.track_id, clip)
     return JSONResponse(
         {
             "clip_id": clip_id,
@@ -154,6 +157,10 @@ def debug_clip(clip_id: str) -> JSONResponse:
             "resolved_path": str(path),
             "exists": path.exists(),
             "size": path.stat().st_size if path.exists() else None,
+            "fallback_path": str(fallback_path),
+            "fallback_exists": fallback_path.exists(),
+            "source_path": str(source_info[0]) if source_info else None,
+            "source_exists": source_info[0].exists() if source_info else False,
         }
     )
 
@@ -161,7 +168,11 @@ def debug_clip(clip_id: str) -> JSONResponse:
 @app.get("/source/{clip_id}")
 def source_media(clip_id: str, range_header: str | None = Header(default=None, alias="Range")) -> Response:
     clip = find_clip(state, clip_id)
-    return audio_response(resolve_project_path(clip.source_audio_path), clip.source_filename, range_header)
+    source_info = find_existing_source_audio(clip.track_id, clip)
+    if source_info is None:
+        return audio_response(resolve_project_path(clip.source_audio_path), clip.source_filename, range_header)
+    source_path, source_filename, _ = source_info
+    return audio_response(source_path, source_filename, range_header)
 
 
 @app.get("/edit/source/{track_id}")
@@ -192,13 +203,74 @@ def find_existing_source_audio(track_id: str, preferred_clip: Any | None = None)
         path = resolve_project_path(path_value)
         if path.exists():
             return path, filename or path.name, path_value
+        found_path = find_audio_by_filename(filename)
+        if found_path is not None:
+            return found_path, filename or found_path.name, relative_or_absolute_app(found_path)
     return None
+
+
+def find_existing_clip_audio(clip: Any) -> Path:
+    candidates = [
+        resolve_project_path(clip.clip_path),
+        resolve_project_path(config.clips_dir) / Path(clip.clip_path).name,
+        resolve_project_path(config.clips_dir) / ensure_wav_filename(clip.export_filename or clip.display_name),
+        resolve_project_path(config.final_output_dir)
+        / safe_output_folder_name(clip.final_label or "待复核")
+        / ensure_wav_filename(clip.export_filename or clip.display_name),
+    ]
+    for path in candidates:
+        if path.exists():
+            return path
+    return candidates[0]
+
+
+def find_audio_by_filename(filename: str) -> Path | None:
+    if not filename:
+        return None
+    roots = [
+        resolve_project_path(config.raw_audio_dir),
+        resolve_project_path(config.processed_audio_dir),
+    ]
+    for root in roots:
+        direct = root / filename
+        if direct.exists():
+            return direct
+        if root.exists():
+            try:
+                match = next((path for path in root.rglob(filename) if path.is_file()), None)
+            except OSError:
+                match = None
+            if match is not None:
+                return match
+    return None
+
+
+def ensure_wav_filename(filename: str) -> str:
+    path = Path(filename)
+    return f"{path.stem}.wav"
+
+
+def safe_output_folder_name(name: str) -> str:
+    clean = "".join("_" if char in r'\/:*?"<>|' else char for char in name).strip()
+    return clean or "待复核"
+
+
+def relative_or_absolute_app(path: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(ROOT.resolve()))
+    except ValueError:
+        return str(path)
 
 
 def audio_response(path: Path, filename: str, range_header: str | None = None) -> Response:
     path = path.expanduser()
     if not path.exists():
-        return Response(content=f"Audio file not found: {path}", status_code=404, media_type="text/plain; charset=utf-8")
+        return Response(
+            content=f"Audio file not found: {path}",
+            status_code=404,
+            media_type="text/plain; charset=utf-8",
+            headers={"Cache-Control": "no-store"},
+        )
     size = path.stat().st_size
     media_type = audio_media_type(path)
     headers = {
