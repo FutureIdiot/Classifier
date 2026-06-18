@@ -111,6 +111,9 @@ def rebuild_edit_session_from_state() -> dict | None:
         return None
     track_id = editing_clips[0].track_id
     track_clips = [clip for clip in editing_clips if clip.track_id == track_id]
+    source_info = find_existing_source_audio(track_id, track_clips[0])
+    source_filename = source_info[1] if source_info else track_clips[0].source_filename
+    source_audio_path = source_info[2] if source_info else track_clips[0].source_audio_path
     regions = [
         {
             "clip_id": item.clip_id,
@@ -124,8 +127,8 @@ def rebuild_edit_session_from_state() -> dict | None:
     ]
     return {
         "track_id": track_id,
-        "source_filename": track_clips[0].source_filename,
-        "source_audio_path": track_clips[0].source_audio_path,
+        "source_filename": source_filename,
+        "source_audio_path": source_audio_path,
         "old_status": {clip.clip_id: "confirmed" for clip in track_clips},
         "regions": regions,
     }
@@ -163,10 +166,33 @@ def source_media(clip_id: str, range_header: str | None = Header(default=None, a
 
 @app.get("/edit/source/{track_id}")
 def edit_source_media(track_id: str, range_header: str | None = Header(default=None, alias="Range")) -> Response:
-    source_clip = next((clip for clip in state.clips if clip.track_id == track_id), None)
-    if source_clip is None:
+    source_info = find_existing_source_audio(track_id)
+    if source_info is None:
         raise KeyError(f"找不到原曲：{track_id}")
-    return audio_response(resolve_project_path(source_clip.source_audio_path), source_clip.source_filename, range_header)
+    source_path, source_filename, _ = source_info
+    return audio_response(source_path, source_filename, range_header)
+
+
+def find_existing_source_audio(track_id: str, preferred_clip: Any | None = None) -> tuple[Path, str, str] | None:
+    candidates: list[tuple[str, str]] = []
+    if preferred_clip is not None:
+        candidates.append((preferred_clip.source_audio_path, preferred_clip.source_filename))
+    if edit_session and edit_session.get("track_id") == track_id:
+        candidates.append((edit_session.get("source_audio_path", ""), edit_session.get("source_filename", "")))
+
+    track_clips = [clip for clip in state.clips if clip.track_id == track_id]
+    track_clips.sort(key=lambda clip: (clip.status in {"replaced", "hidden"}, clip.start_sec))
+    candidates.extend((clip.source_audio_path, clip.source_filename) for clip in track_clips)
+
+    seen: set[str] = set()
+    for path_value, filename in candidates:
+        if not path_value or path_value in seen:
+            continue
+        seen.add(path_value)
+        path = resolve_project_path(path_value)
+        if path.exists():
+            return path, filename or path.name, path_value
+    return None
 
 
 def audio_response(path: Path, filename: str, range_header: str | None = None) -> Response:
@@ -300,6 +326,17 @@ async def start_edit_clip(request: Request) -> JSONResponse:
     global edit_session
     payload = await request.json()
     clip = find_clip(state, payload["clip_id"])
+    source_info = find_existing_source_audio(clip.track_id, clip)
+    if source_info is None:
+        return JSONResponse(
+            {"ok": False, "error": f"找不到原曲文件，无法进入编辑区：{clip.source_filename}"},
+            status_code=400,
+        )
+    _, source_filename, source_audio_path = source_info
+    for item in state.clips:
+        if item.track_id == clip.track_id:
+            item.source_audio_path = source_audio_path
+            item.source_filename = source_filename
     track_clips = [
         item
         for item in state.clips
@@ -322,8 +359,8 @@ async def start_edit_clip(request: Request) -> JSONResponse:
     save_results(state)
     edit_session = {
         "track_id": clip.track_id,
-        "source_filename": clip.source_filename,
-        "source_audio_path": clip.source_audio_path,
+        "source_filename": source_filename,
+        "source_audio_path": source_audio_path,
         "old_status": old_status,
         "regions": regions,
     }
@@ -1004,9 +1041,10 @@ def add_styles() -> None:
               method: 'POST',
               headers: {'Content-Type': 'application/json'},
               body: JSON.stringify({clip_id: clipId})
-            }).then(response => {
-              if (!response.ok) throw new Error('HTTP ' + response.status);
-              return response.json();
+            }).then(async response => {
+              const data = await response.json().catch(() => ({}));
+              if (!response.ok) throw new Error(data.error || ('HTTP ' + response.status));
+              return data;
             }).then(() => window.location.reload())
               .catch(error => alert('进入编辑区失败：' + error.message));
           }
@@ -1034,6 +1072,7 @@ def add_styles() -> None:
 
             try {
               const response = await fetch(root.dataset.sourceUrl);
+              if (!response.ok) throw new Error('HTTP ' + response.status);
               const buffer = await response.arrayBuffer();
               const audioContext = new (window.AudioContext || window.webkitAudioContext)();
               const audioBuffer = await audioContext.decodeAudioData(buffer.slice(0));
