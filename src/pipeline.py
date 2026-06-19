@@ -9,6 +9,8 @@ from pathlib import Path
 
 from src.audio_utils import (
     clip_audio,
+    clip_codec,
+    clip_extension,
     create_gemini_upload_audio,
     file_size_mb,
     get_audio_duration,
@@ -245,6 +247,9 @@ def archive_successful_audio_source(
     if audio_path.resolve() == target_path.resolve():
         emit(progress, f"已处理音频归档目录不能与原始目录相同，保留原文件：{audio_path.name}")
         return None
+
+    backup_original_audio_source(audio_path, relative_path, track_id, config, progress)
+
     try:
         target_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(audio_path), str(target_path))
@@ -265,6 +270,52 @@ def archive_successful_audio_source(
             clip.source_audio_path = archived_source_path
     emit(progress, f"已从原始目录移走成功音频：{audio_path.name} -> {target_path}")
     return target_path
+
+
+def backup_original_audio_source(
+    audio_path: Path,
+    relative_path: Path,
+    track_id: str,
+    config: AppConfig,
+    progress: ProgressCallback | None = None,
+) -> Path | None:
+    """把原始音频复制一份到独立备份目录，作为母带冗余。
+
+    备份目录与原始目录、归档目录重合或位于其内部时跳过，避免自引用。
+    备份失败不阻断主流程，仅记录错误。
+    """
+    if not config.enable_original_backup:
+        return None
+    raw_root = resolve_project_path(config.raw_audio_dir)
+    backup_root = resolve_project_path(config.original_backup_dir)
+    archive_root = resolve_project_path(config.processed_audio_dir)
+    try:
+        backup_root.resolve().relative_to(raw_root.resolve())
+        emit(progress, f"备份目录位于原始目录内，跳过原始音频备份：{audio_path.name}")
+        return None
+    except ValueError:
+        pass
+    if backup_root.resolve() == archive_root.resolve():
+        emit(progress, f"备份目录与归档目录相同，跳过原始音频备份：{audio_path.name}")
+        return None
+    backup_target = unique_archive_path(backup_root / relative_path)
+    if backup_target.resolve() == audio_path.resolve():
+        return None
+    try:
+        backup_target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(str(audio_path), str(backup_target))
+    except OSError as exc:
+        emit(progress, f"备份原始音频失败：{audio_path.name}，{exc}")
+        log_error(
+            "backup_source_failed",
+            track_id=track_id,
+            source_audio_path=str(audio_path),
+            backup_audio_path=str(backup_target),
+            error=str(exc),
+        )
+        return None
+    emit(progress, f"已备份原始音频：{audio_path.name} -> {backup_target}")
+    return backup_target
 
 
 def unique_archive_path(path: Path) -> Path:
@@ -295,13 +346,15 @@ def segment_to_clip_record(
     label = normalize_label(segment.label, config)
     section = segment.section if segment.section in {"verse", "chorus"} else "unknown"
     clip_id = f"{track_id}_{section}_{segment_index:02d}"
-    clip_path = resolve_project_path(config.clips_dir) / f"{clip_id}.wav"
+    clip_ext = clip_extension(config.clip_format)
+    clip_path = resolve_project_path(config.clips_dir) / f"{clip_id}{clip_ext}"
     actual_duration = clip_audio(
         source_path=source_path,
         clip_path=clip_path,
         start_sec=segment.start_sec,
         end_sec=segment.end_sec,
         source_duration_sec=source_duration_sec,
+        audio_codec=clip_codec(config.clip_format),
     )
     display_name = clip_id
     return ClipRecord(
@@ -321,7 +374,7 @@ def segment_to_clip_record(
         needs_review=segment.needs_review or label == "待复核",
         reason=segment.reason,
         display_name=display_name,
-        export_filename=f"{display_name}.wav",
+        export_filename=f"{display_name}{clip_ext}",
         status="confirmed" if actual_duration > 0 else "needs_review",
     )
 
@@ -340,8 +393,16 @@ def recut_clip(
     if end_sec <= start_sec:
         raise ValueError("结束时间必须大于开始时间。")
     new_clip_id = f"{source_clip.clip_id}_recut_{uuid.uuid4().hex[:6]}"
-    clip_path = resolve_project_path(config.clips_dir) / f"{new_clip_id}.wav"
-    actual_duration = clip_audio(source_path, clip_path, start_sec, end_sec, source_duration)
+    clip_ext = clip_extension(config.clip_format)
+    clip_path = resolve_project_path(config.clips_dir) / f"{new_clip_id}{clip_ext}"
+    actual_duration = clip_audio(
+        source_path,
+        clip_path,
+        start_sec,
+        end_sec,
+        source_duration,
+        audio_codec=clip_codec(config.clip_format),
+    )
     label = final_label or source_clip.final_label
     if label not in {category.name for category in config.categories if category.name.strip()}:
         label = normalize_label(label, config)
@@ -356,7 +417,7 @@ def recut_clip(
             "manual_label": label if label != source_clip.model_label else source_clip.manual_label,
             "final_label": label,
             "display_name": new_clip_id,
-            "export_filename": f"{new_clip_id}.wav",
+            "export_filename": f"{new_clip_id}{clip_ext}",
             "status": "confirmed" if actual_duration > 0 else "needs_review",
         }
     )
@@ -376,7 +437,8 @@ def update_clip_display_name(state: ResultsState, clip_id: str, display_name: st
     clip = find_clip(state, clip_id)
     clean = display_name.strip() or clip.clip_id
     clip.display_name = clean
-    clip.export_filename = f"{Path(clean).stem}.wav"
+    suffix = Path(clip.clip_path).suffix or ".wav"
+    clip.export_filename = f"{Path(clean).stem}{suffix}"
     save_results(state)
 
 

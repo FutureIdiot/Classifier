@@ -9,6 +9,16 @@ from pathlib import Path
 SUPPORTED_AUDIO_EXTENSIONS = {".wav", ".mp3", ".m4a", ".flac", ".aac", ".ogg"}
 
 
+def clip_extension(clip_format: str) -> str:
+    """切片输出扩展名，默认 wav（无损，供训练），flac 作为兼容选项。"""
+    return ".flac" if (clip_format or "wav").lower() == "flac" else ".wav"
+
+
+def clip_codec(clip_format: str) -> str:
+    """切片输出 ffmpeg 编码器，与 clip_extension 对应。"""
+    return "flac" if (clip_format or "wav").lower() == "flac" else "pcm_s16le"
+
+
 def scan_audio_files(raw_audio_dir: Path) -> list[Path]:
     if not raw_audio_dir.exists():
         raw_audio_dir.mkdir(parents=True, exist_ok=True)
@@ -88,7 +98,8 @@ def clip_audio(
     start_sec: float,
     end_sec: float,
     source_duration_sec: float,
-    padding_sec: float = 0.3,
+    padding_sec: float = 0.0,
+    audio_codec: str = "pcm_s16le",
 ) -> float:
     require_binary("ffmpeg")
     if start_sec < 0 or end_sec <= start_sec:
@@ -114,7 +125,7 @@ def clip_audio(
         f"{duration:.3f}",
         "-vn",
         "-acodec",
-        "pcm_s16le",
+        audio_codec,
         str(clip_path),
     ]
     run_audio_command(command)

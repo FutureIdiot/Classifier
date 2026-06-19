@@ -57,6 +57,7 @@ def ensure_directories(config: AppConfig) -> None:
         config.raw_audio_dir,
         config.clips_dir,
         config.processed_audio_dir,
+        config.original_backup_dir,
         config.final_output_dir,
         config.completed_output_dir,
         config.export_dir,
@@ -86,9 +87,7 @@ def load_app_config() -> AppConfig:
 
 def save_app_config(config: AppConfig) -> None:
     normalize_categories(config)
-    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with CONFIG_PATH.open("w", encoding="utf-8") as handle:
-        json.dump(config.model_dump(), handle, ensure_ascii=False, indent=2)
+    atomic_write_json(CONFIG_PATH, config.model_dump())
     ensure_directories(config)
 
 
@@ -101,9 +100,7 @@ def load_results() -> ResultsState:
 
 
 def save_results(state: ResultsState) -> None:
-    RESULTS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with RESULTS_PATH.open("w", encoding="utf-8") as handle:
-        json.dump(state.model_dump(), handle, ensure_ascii=False, indent=2)
+    atomic_write_json(RESULTS_PATH, state.model_dump())
 
 
 def load_completed_tracks() -> dict:
@@ -124,15 +121,33 @@ def load_completed_tracks() -> dict:
 
 def save_completed_tracks(payload: dict) -> None:
     payload.setdefault("tracks", {})
-    COMPLETED_TRACKS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with COMPLETED_TRACKS_PATH.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False, indent=2)
+    atomic_write_json(COMPLETED_TRACKS_PATH, payload)
 
 
 def append_jsonl(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def atomic_write_json(path: Path, payload: object) -> None:
+    """写入 JSON：先写临时文件再原子替换，并保留上一版本 .bak。
+
+    崩溃时目标文件要么是完整的旧内容、要么是完整的新内容，不会出现截断。
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with tmp_path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+        handle.flush()
+        os.fsync(handle.fileno())
+    if path.exists():
+        try:
+            backup_path = path.with_suffix(path.suffix + ".bak")
+            os.replace(path, backup_path)
+        except OSError:
+            pass
+    os.replace(tmp_path, path)
 
 
 def normalize_categories(config: AppConfig) -> None:

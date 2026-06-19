@@ -17,11 +17,14 @@ class AppConfig(BaseModel):
     raw_audio_dir: str = "raw_audio"
     clips_dir: str = "output/clips"
     processed_audio_dir: str = "workspaces/processed_input"
+    original_backup_dir: str = "backups/originals"
+    enable_original_backup: bool = True
     final_output_dir: str = "output/final"
     completed_output_dir: str = "completed_results"
     export_dir: str = "output/exports"
     downloads_dir: str = "~/Downloads"
     gemini_uploads_dir: str = "output/gemini_uploads"
+    clip_format: str = "wav"
     gemini_model: str = "gemini-3.1-pro-preview"
     gemini_timeout_sec: int = 180
     gemini_retry_count: int = 1

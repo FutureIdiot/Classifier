@@ -39,6 +39,7 @@ from src.export_utils import (
     append_completed_folders,
     build_zip,
     clear_classified_workspace,
+    clear_clips_workspace,
     export_csv,
     open_folder,
     sync_classified_folders,
@@ -286,13 +287,16 @@ def find_existing_source_audio(track_id: str, preferred_clip: Any | None = None)
 
 
 def find_existing_clip_audio(clip: Any) -> Path:
+    suffix = Path(clip.clip_path).suffix or ".wav"
+    stem = Path(clip.export_filename or clip.display_name or clip.clip_id).stem
+    expected_name = f"{stem}{suffix}"
     candidates = [
         resolve_project_path(clip.clip_path),
         resolve_project_path(config.clips_dir) / Path(clip.clip_path).name,
-        resolve_project_path(config.clips_dir) / ensure_wav_filename(clip.export_filename or clip.display_name),
+        resolve_project_path(config.clips_dir) / expected_name,
         resolve_project_path(config.final_output_dir)
         / safe_output_folder_name(clip.final_label or "待复核")
-        / ensure_wav_filename(clip.export_filename or clip.display_name),
+        / expected_name,
     ]
     for path in candidates:
         if path.exists():
@@ -319,11 +323,6 @@ def find_audio_by_filename(filename: str) -> Path | None:
             if match is not None:
                 return match
     return None
-
-
-def ensure_wav_filename(filename: str) -> str:
-    path = Path(filename)
-    return f"{path.stem}.wav"
 
 
 def safe_output_folder_name(name: str) -> str:
@@ -689,7 +688,8 @@ async def commit_edit_regions(request: Request) -> JSONResponse:
         new_clip = recut_clip(config, state, clip_id, start_sec, end_sec, final_label)
         new_clip.status = "manual_reviewed"
         new_clip.display_name = region.get("display_name") or new_clip.display_name
-        new_clip.export_filename = f"{Path(new_clip.display_name).stem}.wav"
+        clip_suffix = Path(new_clip.clip_path).suffix or ".wav"
+        new_clip.export_filename = f"{Path(new_clip.display_name).stem}{clip_suffix}"
         created += 1
     for clip in state.clips:
         if clip.track_id == edit_session["track_id"] and clip.status == "editing" and clip.clip_id not in selected_clip_ids:
@@ -1167,6 +1167,7 @@ def finalize_current_batch() -> bool:
     record_completed_tracks(clips)
     archive_completed_input_files({clip.track_id for clip in clips})
     clear_classified_workspace(config)
+    clear_clips_workspace(config)
     state = ResultsState()
     save_results(state)
     edit_session = None
@@ -1374,11 +1375,18 @@ def settings_dialog():
         raw_audio = ui.input("原始音频目录", value=config.raw_audio_dir).props("outlined dense").classes("w-full")
         clips_dir = ui.input("片段输出目录", value=config.clips_dir).props("outlined dense").classes("w-full")
         processed_audio_dir = ui.input("已处理原曲归档目录", value=config.processed_audio_dir).props("outlined dense").classes("w-full")
+        original_backup_dir = ui.input("原始音频备份目录", value=config.original_backup_dir).props("outlined dense").classes("w-full")
+        enable_original_backup = ui.checkbox("启用原始音频备份（input 本身已是备份来源时可关闭）", value=config.enable_original_backup)
         final_dir = ui.input("当前任务结果目录", value=config.final_output_dir).props("outlined dense").classes("w-full")
         completed_dir = ui.input("累计结果目录", value=config.completed_output_dir).props("outlined dense").classes("w-full")
         export_dir = ui.input("导出目录", value=config.export_dir).props("outlined dense").classes("w-full")
         downloads_dir = ui.input("ZIP 下载目录", value=config.downloads_dir).props("outlined dense").classes("w-full")
         gemini_uploads_dir = ui.input("Gemini 上传代理目录", value=config.gemini_uploads_dir).props("outlined dense").classes("w-full")
+        clip_format = ui.select(
+            "切片输出格式",
+            options=["wav", "flac"],
+            value="flac" if (config.clip_format or "wav").lower() == "flac" else "wav",
+        ).props("outlined dense").classes("w-full")
         model = ui.input("Gemini 模型名", value=config.gemini_model).props("outlined dense").classes("w-full")
         timeout = ui.number("Gemini 超时秒数", value=config.gemini_timeout_sec, min=30, step=30, format="%d").props("outlined dense").classes("w-full")
         retry_count = ui.number("Gemini 单曲失败重试次数", value=config.gemini_retry_count, min=0, max=5, step=1, format="%d").props("outlined dense").classes("w-full")
@@ -1401,11 +1409,14 @@ def settings_dialog():
             config.raw_audio_dir = raw_audio.value
             config.clips_dir = clips_dir.value
             config.processed_audio_dir = processed_audio_dir.value
+            config.original_backup_dir = original_backup_dir.value
+            config.enable_original_backup = bool(enable_original_backup.value)
             config.final_output_dir = final_dir.value
             config.completed_output_dir = completed_dir.value
             config.export_dir = export_dir.value
             config.downloads_dir = downloads_dir.value
             config.gemini_uploads_dir = gemini_uploads_dir.value
+            config.clip_format = (clip_format.value or "wav").lower()
             config.gemini_model = model.value
             config.gemini_timeout_sec = int(timeout.value or 180)
             config.gemini_retry_count = int(retry_count.value or 0)

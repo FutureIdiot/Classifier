@@ -9,5 +9,10 @@ output/
 input/
 workspaces/
 completed_results/
+backups/
 data/*.json
 data/*.jsonl
+
+# atomic_write_json 临时与备份文件
+*.tmp
+*.bak

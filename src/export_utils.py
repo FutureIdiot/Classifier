@@ -58,7 +58,7 @@ def sync_classified_folders(state: ResultsState, config: AppConfig) -> Path:
     final_dir.mkdir(parents=True, exist_ok=True)
     manifest = load_manifest(final_dir)
     used_names: dict[Path, set[str]] = {}
-    replaceable_targets = replaceable_output_paths(state, final_dir, manifest)
+    replaceable_targets = replaceable_output_paths(state, final_dir, manifest, config.clip_format)
     visible_ids = {clip.clip_id for clip in visible_clips(state)}
 
     for clip in visible_clips(state):
@@ -80,7 +80,7 @@ def sync_track_classified_folders(state: ResultsState, config: AppConfig, track_
     final_dir.mkdir(parents=True, exist_ok=True)
     manifest = load_manifest(final_dir)
     used_names: dict[Path, set[str]] = {}
-    replaceable_targets = replaceable_output_paths(state, final_dir, manifest)
+    replaceable_targets = replaceable_output_paths(state, final_dir, manifest, config.clip_format)
     visible_ids = {clip.clip_id for clip in visible_clips(state)}
     for clip in visible_clips(state):
         if clip.track_id == track_id:
@@ -120,7 +120,7 @@ def sync_classified_clip(
     label = safe_folder_name(clip.final_label or "待复核")
     target_dir = final_dir / label
     target_dir.mkdir(parents=True, exist_ok=True)
-    filename = ensure_wav_suffix(clip.export_filename or clip.display_name)
+    filename = ensure_clip_suffix(clip.export_filename or clip.display_name, config.clip_format)
     desired_path = target_dir / filename
     desired_rel = desired_path.relative_to(final_dir).as_posix()
     prior_manifest_path: Path | None = None
@@ -189,7 +189,7 @@ def append_completed_folders(config: AppConfig) -> Path:
             relative = Path(source.name)
         target_dir = completed_dir / relative.parent
         target_dir.mkdir(parents=True, exist_ok=True)
-        filename = ensure_wav_suffix(source.name)
+        filename = ensure_clip_suffix(source.name, config.clip_format)
         target_name = unique_filename(filename, used_names.setdefault(target_dir, existing_file_names(target_dir)))
         shutil.copy2(source, target_dir / target_name)
     return completed_dir
@@ -209,10 +209,30 @@ def clear_classified_workspace(config: AppConfig) -> Path:
     return final_dir
 
 
+def clear_clips_workspace(config: AppConfig) -> Path:
+    """finalize 后清空切片工作目录。
+
+    此时所有可见切片已复制进 completed_results，state 即将清空，
+    slices/ 不再被引用，删除可消除与归档目录的永久双份冗余。
+    """
+    clips_dir = resolve_project_path(config.clips_dir)
+    clips_dir.mkdir(parents=True, exist_ok=True)
+    for child in clips_dir.iterdir():
+        try:
+            if child.is_dir():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+        except OSError:
+            pass
+    return clips_dir
+
+
 def replaceable_output_paths(
     state: ResultsState,
     final_dir: Path,
     manifest: dict[str, dict[str, str]],
+    clip_format: str = "wav",
 ) -> set[str]:
     status_by_id = {clip.clip_id: clip.status for clip in state.clips}
     replaceable: set[str] = {
@@ -224,7 +244,7 @@ def replaceable_output_paths(
         if clip.status != "replaced":
             continue
         label = safe_folder_name(clip.final_label or "待复核")
-        filename = ensure_wav_suffix(clip.export_filename or clip.display_name)
+        filename = ensure_clip_suffix(clip.export_filename or clip.display_name, clip_format)
         replaceable.add((final_dir / label / filename).relative_to(final_dir).as_posix())
     return replaceable
 
@@ -295,9 +315,10 @@ def safe_folder_name(name: str) -> str:
     return clean or "待复核"
 
 
-def ensure_wav_suffix(filename: str) -> str:
+def ensure_clip_suffix(filename: str, clip_format: str = "wav") -> str:
     path = Path(filename)
-    return f"{path.stem}.wav"
+    suffix = ".flac" if (clip_format or "wav").lower() == "flac" else ".wav"
+    return f"{path.stem}{suffix}"
 
 
 def existing_file_names(target_dir: Path) -> set[str]:
